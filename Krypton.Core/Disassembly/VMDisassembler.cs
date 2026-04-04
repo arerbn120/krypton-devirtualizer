@@ -19,8 +19,19 @@ namespace Krypton.Core.Disassembly
             Ctx.Parser.Reader.BaseStream.Position = methodKey;
 
             var mdToken = Ctx.Parser.ReadEncryptedByte();
-            var parentMethod = ((IMethodDescriptor) Ctx.Module.LookupMember(mdToken)).Resolve();
-            method.Parent = parentMethod;
+            try
+            {
+                var parentMethod = ((IMethodDescriptor) Ctx.Module.LookupMember(mdToken)).Resolve();
+                method.Parent = parentMethod;
+            }
+            catch
+            {
+                // Some samples reference metadata tokens that cannot be resolved in the loaded module.
+                // Keep disassembly running and let later stages skip unresolved methods safely.
+                method.Parent = null;
+                Ctx.Options.Logger.Warning(
+                    $"Disassembling warning: could not resolve parent method token 0x{mdToken:X8} at method key {methodKey}.");
+            }
 
             var locals = Ctx.Parser.ReadEncryptedByte();
             var exceptionHandlers = Ctx.Parser.ReadEncryptedByte();
@@ -63,16 +74,22 @@ namespace Krypton.Core.Disassembly
 
         public void ReadAllInstructions(VMMethod method, int instructions)
         {
+            var operandTypes = Ctx.GetOperandTypes();
             for (var i = 0; i < instructions; i++)
             {
                 var b = Ctx.Parser.Reader.ReadByte();
-                if (b < 0 || b >= Ctx.Parser.Operands.Length)
+                if (b < 0 || b >= operandTypes.Length)
                     throw new DevirtualizationException($"Disassembling exception: invalid VM opcode byte {b}.");
 
                 var instr = new VMInstruction(VMOpCode.Nop, null, i, b);
                 instr.OpCode = Ctx.PatternMatcher.GetOpCodeValue(b);
+                instr.IsResolved = Ctx.PatternMatcher.IsOpCodeValueKnown(b);
 
-                instr.Operand = ReadOperand(Ctx.Parser.Operands[b]);
+                var operandType = operandTypes[b];
+                if (Ctx.TryGetOperandType(b, out var modeledOperandType))
+                    operandType = modeledOperandType;
+
+                instr.Operand = ReadOperand(operandType);
                 method.MethodBody.Instructions.Add(instr);
             }
         }

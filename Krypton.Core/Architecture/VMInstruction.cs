@@ -24,12 +24,14 @@ namespace Krypton.Core.Architecture
             Operand = operand;
             Offset = offset;
             VmByte = vmByte;
+            IsResolved = opcode != VMOpCode.Nop;
         }
 
         public VMOpCode OpCode { get; set; }
         public object Operand { get; set; }
         public int Offset { get; set; }
         public int VmByte { get; set; }
+        public bool IsResolved { get; set; }
 
         public override string ToString()
         {

@@ -14,8 +14,9 @@ Krypton processes a virtualized assembly and reconstructs virtualized methods ba
 1. `ResourceParsing` - locates VM payload and decodes layout (operands, strings, method keys).
 2. `OpcodeMapping` - finds the handler switch method and maps VM byte -> semantic opcode via pattern matching.
 3. `MethodDisassembling` - disassembles VM methods into an intermediate model.
-4. `MethodRecompiling` - translates VM model back into compilable CIL.
-5. `MethodReplacing` - replaces virtualized method bodies with recompiled ones.
+4. `SemanticValidation` - runs a lightweight VM semantic validator (CFG + stack effects) and adjusts unsafe low-confidence mappings.
+5. `MethodRecompiling` - translates VM model back into compilable CIL.
+6. `MethodReplacing` - replaces virtualized method bodies with recompiled ones.
 
 ## What Was Improved In This Fork
 ### 1) Project modernization
@@ -41,6 +42,7 @@ Krypton processes a virtualized assembly and reconstructs virtualized methods ba
 - Reactor/WinForms stabilization enabled by default:
   - `Hashtable::.ctor(int)` capacity sanitization,
   - WinForms entry guard bypass (pattern-based),
+  - anti-manipulation method neutralization (string/API heuristics),
   - shared bootstrap worker neutralization (generic heuristic).
 
 ### 4) Better diagnostics and observability
@@ -112,15 +114,22 @@ For `sample.exe`:
 - `KRYPTON_NO_PAUSE=1`
 - `KRYPTON_LOG_VM_MAP=1`
 - `KRYPTON_LOG_LOCAL_TYPES=1`
+- `KRYPTON_LOG_EXCEPTIONS=1`
+
+### Mapping behavior
+- `KRYPTON_ENABLE_AGGRESSIVE_LAST_RESORT=1` (enables aggressive tie-breaks in rare-opcode inference; default is strict/safety-first)
 
 ### Runtime stabilization
 - `KRYPTON_DISABLE_HASHTABLE_SANITIZE=1`
 - `KRYPTON_DISABLE_WINFORMS_GUARD_BYPASS=1`
+- `KRYPTON_DISABLE_STRING_ANTI_MANIPULATION_PATCH=1`
 - `KRYPTON_DISABLE_SHARED_BOOTSTRAP_NEUTRALIZE=1`
 - `KRYPTON_DISABLE_STARTUP_GUARD=1`
 - `KRYPTON_DISABLE_ALL_BOOTSTRAP_CCTORS=1`
 
 ### Write / patch behavior
+- `KRYPTON_ALLOW_PARTIAL_OUTPUT=1` (allows writing when some VM opcodes remain unresolved)
+- `KRYPTON_ALLOW_STABILIZATION_ONLY_OUTPUT=1` (allows output even with zero recompiled methods, applying only stabilization patches)
 - `KRYPTON_USE_INPLACE_PATCH=1` (forces in-place patch mode instead of default rewrite mode)
 - `KRYPTON_STRIP_MALFORMED_ATTRIBUTES=1`
 

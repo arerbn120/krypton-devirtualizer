@@ -11,6 +11,7 @@ namespace Krypton.Core.PatternMatching
     public class PatternMatcher
     {
         private const int FallbackWindow = 256;
+        private readonly HashSet<int> _knownValues = new HashSet<int>();
         private readonly Dictionary<MethodDefinition, IFieldDescriptor> _stlocArrayFieldCache =
             new Dictionary<MethodDefinition, IFieldDescriptor>();
         private readonly HashSet<MethodDefinition> _stlocArrayFieldCacheResolved =
@@ -20,13 +21,26 @@ namespace Krypton.Core.PatternMatching
         {
             OpCodes = new Dictionary<int, VMOpCode>();
             Patterns = new List<IPattern>();
-            foreach (var type in typeof(PatternMatcher).Assembly.GetTypes())
-                if (type.GetInterface(nameof(IPattern)) != null)
-                    if (Activator.CreateInstance(type) is IPattern instance)
-                        Patterns.Add(instance);
+            var patternTypes = typeof(PatternMatcher).Assembly.GetTypes()
+                .Where(type => typeof(IPattern).IsAssignableFrom(type) && !type.IsInterface && !type.IsAbstract)
+                .OrderBy(type => type.FullName, StringComparer.Ordinal)
+                .ToList();
 
-            // Prefer stricter signatures first to reduce ambiguous matches.
-            Patterns = Patterns.OrderByDescending(p => p.Pattern.Count).ToList();
+            foreach (var type in patternTypes)
+            {
+                if (Activator.CreateInstance(type) is IPattern instance)
+                    Patterns.Add(instance);
+            }
+
+            // Deterministic ordering:
+            // 1) explicit priority,
+            // 2) stricter signatures,
+            // 3) full type name as stable tie-break.
+            Patterns = Patterns
+                .OrderByDescending(GetPatternPriority)
+                .ThenByDescending(p => p.Pattern.Count)
+                .ThenBy(p => p.GetType().FullName, StringComparer.Ordinal)
+                .ToList();
         }
 
         private Dictionary<int, VMOpCode> OpCodes { get; }
@@ -34,7 +48,31 @@ namespace Krypton.Core.PatternMatching
 
         public void SetOpCodeValue(VMOpCode opCode, int value)
         {
+            _knownValues.Add(value);
+            if (opCode == VMOpCode.Nop)
+            {
+                OpCodes.Remove(value);
+                return;
+            }
+
             OpCodes[value] = opCode;
+        }
+
+        public void MarkKnownNoOpValue(int value)
+        {
+            _knownValues.Add(value);
+            OpCodes.Remove(value);
+        }
+
+        public bool IsOpCodeValueKnown(int value)
+        {
+            return _knownValues.Contains(value);
+        }
+
+        public void UnsetOpCodeValue(int value)
+        {
+            _knownValues.Remove(value);
+            OpCodes.Remove(value);
         }
 
         public VMOpCode GetOpCodeValue(int value)
@@ -45,12 +83,20 @@ namespace Krypton.Core.PatternMatching
 
         public VMOpCode FindOpCode(MethodDefinition Method, int index)
         {
+            return FindOpCode(Method, index, true);
+        }
+
+        public VMOpCode FindOpCode(MethodDefinition Method, int index, bool allowFallback)
+        {
             var instructions = Method.CilMethodBody.Instructions.ToList();
             foreach (var pat in Patterns)
                 if (MatchesPattern(pat, instructions, index) && pat.Verify(Method, index))
                 {
                     return pat.Translates;
                 }
+
+            if (!allowFallback)
+                return VMOpCode.Nop;
 
             var inferred = InferFromHandler(Method, instructions, index);
             if (inferred != VMOpCode.Nop)
@@ -61,7 +107,7 @@ namespace Krypton.Core.PatternMatching
 
         public int GetMappedCount()
         {
-            return OpCodes.Count;
+            return _knownValues.Count;
         }
 
         private bool MatchesPattern(IPattern pattern, List<CilInstruction> instructions, int index)
@@ -80,6 +126,21 @@ namespace Krypton.Core.PatternMatching
             return true;
         }
 
+        private int GetPatternPriority(IPattern pattern)
+        {
+            if (pattern == null)
+                return 0;
+
+            if (PatternPriorityRegistry.TryGetPriority(pattern.GetType().FullName, out var configuredPriority))
+                return configuredPriority;
+
+            var attribute = pattern.GetType()
+                .GetCustomAttributes(typeof(PatternPriorityAttribute), inherit: false)
+                .OfType<PatternPriorityAttribute>()
+                .FirstOrDefault();
+            return attribute?.Priority ?? 0;
+        }
+
         private VMOpCode InferFromHandler(MethodDefinition method, List<CilInstruction> instructions, int index)
         {
             if (instructions == null || index < 0 || index >= instructions.Count)
@@ -92,6 +153,9 @@ namespace Krypton.Core.PatternMatching
             var callFlag = TryInferCallFlag(instructions, index, end);
             if (callFlag != VMOpCode.Nop)
                 return callFlag;
+
+            if (LooksLikePackedInt32Load(instructions, index, end))
+                return VMOpCode.Ldc_I4;
 
             if (LooksLikeLdstr(instructions, index, end))
                 return VMOpCode.Ldstr;
@@ -108,14 +172,14 @@ namespace Krypton.Core.PatternMatching
             if (LooksLikeBrLessThan(instructions, index, end))
                 return VMOpCode.BrLessThan;
 
-            if (LooksLikePop(instructions, index, end))
-                return VMOpCode.Pop;
+            if (LooksLikeLdcI4(instructions, index, end))
+                return VMOpCode.Ldc_I4;
 
             if (LooksLikeDup(instructions, index, end))
                 return VMOpCode.Dup;
 
-            if (LooksLikeLdcI4(instructions, index, end))
-                return VMOpCode.Ldc_I4;
+            if (LooksLikePop(instructions, index, end))
+                return VMOpCode.Pop;
 
             var ldlocViaCtor = TryInferLdlocViaCtor(instructions, index, end);
             if (ldlocViaCtor != VMOpCode.Nop)
@@ -196,19 +260,48 @@ namespace Krypton.Core.PatternMatching
 
         private bool LooksLikeLdstr(IReadOnlyList<CilInstruction> instructions, int index, int end)
         {
-            return PatternHelpers.ContainsMethodCallOnType(instructions, index, end - index + 1, "ResolveString", "System.Reflection.Module");
+            return PatternHelpers.ContainsMethodCallWithSignatureOnType(
+                instructions,
+                index,
+                end - index + 1,
+                "System.Reflection.Module",
+                "System.String",
+                "System.Int32");
         }
 
         private bool LooksLikeLdfld(IReadOnlyList<CilInstruction> instructions, int index, int end)
         {
-            if (!PatternHelpers.ContainsMethodCallOnType(instructions, index, end - index + 1, "ResolveField", "System.Reflection.Module"))
+            if (!PatternHelpers.ContainsMethodCallWithSignatureOnType(
+                    instructions,
+                    index,
+                    end - index + 1,
+                    "System.Reflection.Module",
+                    "System.Reflection.FieldInfo",
+                    "System.Int32"))
+            {
                 return false;
-            return PatternHelpers.ContainsMethodCallOnType(instructions, index, end - index + 1, "GetValue", "System.Reflection.FieldInfo");
+            }
+
+            return PatternHelpers.ContainsMethodCallWithSignatureOnType(
+                instructions,
+                index,
+                end - index + 1,
+                "System.Reflection.FieldInfo",
+                "System.Object",
+                "System.Object");
         }
 
         private bool LooksLikeLdlen(IReadOnlyList<CilInstruction> instructions, int index, int end)
         {
-            if (!PatternHelpers.ContainsMethodCallOnType(instructions, index, end - index + 1, "get_Length", "System.Array"))
+            var hasIntLengthGetter = false;
+            for (var i = index; i <= end; i++)
+            {
+                if (!PatternHelpers.CalleeLooksLikeIntLengthGetter(instructions[i]))
+                    continue;
+                hasIntLengthGetter = true;
+                break;
+            }
+            if (!hasIntLengthGetter)
                 return false;
 
             for (var i = index; i <= end; i++)
@@ -257,8 +350,45 @@ namespace Krypton.Core.PatternMatching
 
         private bool LooksLikePop(IReadOnlyList<CilInstruction> instructions, int index, int end)
         {
-            return PatternHelpers.ContainsOpCode(instructions, index, end - index + 1, CilOpCodes.Pop) &&
-                   instructions[end].OpCode == CilOpCodes.Ret;
+            if (instructions[end].OpCode != CilOpCodes.Ret)
+                return false;
+
+            if (!PatternHelpers.ContainsOpCode(instructions, index, end - index + 1, CilOpCodes.Pop))
+                return false;
+
+            // Opaque-predicate-heavy Reactor handlers often contain incidental Pop instructions.
+            // Keep fallback Pop inference intentionally narrow and let more specific loaders win.
+            if (PatternHelpers.ContainsOpCode(instructions, index, end - index + 1, CilOpCodes.Unbox_Any) ||
+                PatternHelpers.ContainsOpCode(instructions, index, end - index + 1, CilOpCodes.Newobj) ||
+                PatternHelpers.ContainsOpCode(instructions, index, end - index + 1, CilOpCodes.Ldtoken) ||
+                PatternHelpers.ContainsOpCode(instructions, index, end - index + 1, CilOpCodes.Castclass) ||
+                PatternHelpers.ContainsOpCode(instructions, index, end - index + 1, CilOpCodes.Isinst) ||
+                PatternHelpers.ContainsOpCode(instructions, index, end - index + 1, CilOpCodes.Ldelem_Ref) ||
+                PatternHelpers.ContainsOpCode(instructions, index, end - index + 1, CilOpCodes.Ldflda))
+            {
+                return false;
+            }
+
+            for (var i = index; i <= end; i++)
+            {
+                var op = instructions[i].OpCode;
+                if (op == CilOpCodes.Br ||
+                    op == CilOpCodes.Br_S ||
+                    op == CilOpCodes.Brtrue ||
+                    op == CilOpCodes.Brtrue_S ||
+                    op == CilOpCodes.Brfalse ||
+                    op == CilOpCodes.Brfalse_S ||
+                    op == CilOpCodes.Blt ||
+                    op == CilOpCodes.Blt_S ||
+                    op == CilOpCodes.Blt_Un ||
+                    op == CilOpCodes.Blt_Un_S ||
+                    op == CilOpCodes.Switch)
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         private bool LooksLikeDup(IReadOnlyList<CilInstruction> instructions, int index, int end)
@@ -311,6 +441,31 @@ namespace Krypton.Core.PatternMatching
             }
 
             return false;
+        }
+
+        private bool LooksLikePackedInt32Load(IReadOnlyList<CilInstruction> instructions, int index, int end)
+        {
+            var ldelemU1Count = 0;
+            var shlCount = 0;
+            var hasOr = false;
+            var callCount = 0;
+
+            for (var i = index; i <= end; i++)
+            {
+                var op = instructions[i].OpCode;
+                if (op == CilOpCodes.Ldelem_U1)
+                    ldelemU1Count++;
+                else if (op == CilOpCodes.Shl)
+                    shlCount++;
+                else if (op == CilOpCodes.Or)
+                    hasOr = true;
+                else if (op == CilOpCodes.Call || op == CilOpCodes.Callvirt)
+                    callCount++;
+            }
+
+            // Generic Reactor-style operand reconstruction:
+            // combine multiple bytes with shifts/or without reflection/runtime calls.
+            return ldelemU1Count >= 2 && shlCount >= 1 && hasOr && callCount == 0;
         }
 
         private bool LooksLikeStloc(IReadOnlyList<CilInstruction> instructions, int index, int end)
@@ -388,22 +543,23 @@ namespace Krypton.Core.PatternMatching
             int index,
             int end)
         {
+            var detected = new HashSet<VMOpCode>();
             foreach (var candidate in GetNonVoidCalls(instructions, index, end).Reverse())
             {
                 if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Conv_I4, 10))
-                    return VMOpCode.Conv_I4;
+                    detected.Add(VMOpCode.Conv_I4);
                 if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Conv_I8, 10))
-                    return VMOpCode.Conv_I8;
+                    detected.Add(VMOpCode.Conv_I8);
                 if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Conv_U1, 10))
-                    return VMOpCode.Conv_U1;
+                    detected.Add(VMOpCode.Conv_U1);
                 if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Not, 10))
-                    return VMOpCode.Not;
+                    detected.Add(VMOpCode.Not);
                 if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Neg, 10))
-                    return VMOpCode.Neg;
+                    detected.Add(VMOpCode.Neg);
             }
 
-            if (LooksLikeUnaryWrapper(instructions, index, end))
-                return VMOpCode.Conv_I4;
+            if (detected.Count == 1)
+                return detected.First();
 
             return VMOpCode.Nop;
         }
@@ -414,22 +570,23 @@ namespace Krypton.Core.PatternMatching
             int index,
             int end)
         {
+            var detected = new HashSet<VMOpCode>();
             foreach (var candidate in GetNonVoidCalls(instructions, index, end).Reverse())
             {
                 if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Add, 10))
-                    return VMOpCode.Add;
+                    detected.Add(VMOpCode.Add);
                 if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Sub, 10))
-                    return VMOpCode.Sub;
+                    detected.Add(VMOpCode.Sub);
                 if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Xor, 10))
-                    return VMOpCode.Xor;
+                    detected.Add(VMOpCode.Xor);
                 if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Shl, 10))
-                    return VMOpCode.Shl;
+                    detected.Add(VMOpCode.Shl);
                 if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Shr, 10))
-                    return VMOpCode.Shr;
+                    detected.Add(VMOpCode.Shr);
             }
 
-            if (LooksLikeBinaryWrapper(instructions, index, end))
-                return VMOpCode.Add;
+            if (detected.Count == 1)
+                return detected.First();
 
             return VMOpCode.Nop;
         }

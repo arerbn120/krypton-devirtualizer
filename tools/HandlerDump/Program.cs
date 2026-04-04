@@ -2,58 +2,129 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
-using AsmResolver.DotNet;
 using AsmResolver.PE.DotNet.Cil;
+using Krypton.Core;
+using Krypton.Core.Parser;
+using Krypton.Pipeline.Stages;
 
 if (args.Length < 2)
 {
-    Console.WriteLine("usage: HandlerDump <assembly> <vm-byte-hex> [vm-byte-hex ...]");
+    Console.WriteLine("usage: HandlerDump <assembly> <vm-byte-hex> [vm-byte-hex ...] [--lines N]");
     return;
 }
 
-var module = ModuleDefinition.FromFile(args[0]);
-var opcodeHandlerMethod = module.GetAllTypes()
-    .SelectMany(t => t.Methods)
-    .FirstOrDefault(m => m.IsIL && m.CilMethodBody != null &&
-                         m.CilMethodBody.Instructions.Count >= 3200 &&
-                         m.CilMethodBody.Instructions.Count(i => i.OpCode == CilOpCodes.Switch) == 1);
+var inputPath = args[0];
+var maxLines = 120;
+var requested = new List<int>();
 
-if (opcodeHandlerMethod?.CilMethodBody == null)
+for (var i = 1; i < args.Length; i++)
+{
+    if (string.Equals(args[i], "--lines", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+    {
+        if (!int.TryParse(args[++i], NumberStyles.Integer, CultureInfo.InvariantCulture, out maxLines) || maxLines <= 0)
+            maxLines = 120;
+        continue;
+    }
+
+    var raw = args[i].Replace("0x", string.Empty, StringComparison.OrdinalIgnoreCase);
+    requested.Add(int.Parse(raw, NumberStyles.HexNumber, CultureInfo.InvariantCulture));
+}
+
+if (requested.Count == 0)
+{
+    Console.WriteLine("no vm bytes requested");
+    return;
+}
+
+var ctx = BuildContext(inputPath);
+if (ctx.OpcodeHandlerMethod?.CilMethodBody?.Instructions == null || ctx.OpcodeHandlerIndices == null)
 {
     Console.WriteLine("handler method not found");
     return;
 }
 
-var body = opcodeHandlerMethod.CilMethodBody;
-var switchInstruction = body.Instructions.First(i => i.OpCode == CilOpCodes.Switch);
-var labels = (IList<ICilLabel>) switchInstruction.Operand;
+var body = ctx.OpcodeHandlerMethod.CilMethodBody;
+var instructions = body.Instructions;
+var handlerStarts = new HashSet<int>(ctx.OpcodeHandlerIndices.Values);
 
-var requested = new List<int>();
-for (var i = 1; i < args.Length; i++)
-{
-    var raw = args[i].Replace("0x", "", StringComparison.OrdinalIgnoreCase);
-    requested.Add(int.Parse(raw, NumberStyles.HexNumber, CultureInfo.InvariantCulture));
-}
+Console.WriteLine($"dispatcher: {ctx.OpcodeHandlerMethod.FullName}");
+Console.WriteLine($"handlers: {ctx.OpcodeHandlerIndices.Count}");
+Console.WriteLine();
 
 foreach (var vm in requested.Distinct())
 {
-    if (vm < 0 || vm >= labels.Count || labels[vm] is not CilInstructionLabel label)
+    if (!ctx.OpcodeHandlerIndices.TryGetValue(vm, out var start))
     {
-        Console.WriteLine($"vm 0x{vm:X2}: out of range");
+        Console.WriteLine($"vm 0x{vm:X2}: handler not found");
+        Console.WriteLine();
         continue;
     }
 
-    var start = body.Instructions.IndexOf(label.Instruction);
-    Console.WriteLine($"==== vm 0x{vm:X2} start={start} ====");
+    var nextHandlerStart = ctx.OpcodeHandlerIndices.Values
+        .Where(index => index > start)
+        .DefaultIfEmpty(instructions.Count)
+        .Min();
 
-    for (var i = start; i < body.Instructions.Count; i++)
+    Console.WriteLine($"==== vm 0x{vm:X2} start={start} next={nextHandlerStart} ====");
+
+    var emitted = 0;
+    for (var i = start; i < instructions.Count && emitted < maxLines; i++, emitted++)
     {
-        var instruction = body.Instructions[i];
+        if (i > start && handlerStarts.Contains(i))
+        {
+            Console.WriteLine($"[stop] reached next handler start at [{i}]");
+            break;
+        }
+
+        var instruction = instructions[i];
         var operand = instruction.Operand == null ? string.Empty : " " + instruction.Operand;
         Console.WriteLine($"[{i}] {instruction.OpCode.Code}{operand}");
+
         if (instruction.OpCode == CilOpCodes.Ret)
             break;
     }
 
     Console.WriteLine();
+}
+
+static DevirtualizationCtx BuildContext(string inputPath)
+{
+    var logger = new ToolLogger();
+    var options = new DevirtualizationOptions(inputPath, logger)
+    {
+        StrictDiagnostics = true
+    };
+    var ctx = new DevirtualizationCtx(options);
+    ctx.ResourceReader = new ResourceParser();
+
+    var resourceParsing = new ResourceParsing();
+    var opcodeMapping = new OpcodeMapping();
+
+    resourceParsing.Run(ctx);
+    opcodeMapping.Run(ctx);
+    return ctx;
+}
+
+file sealed class ToolLogger : ILogger
+{
+    public void Info(string text)
+    {
+    }
+
+    public void InfoStr(string message, string message2)
+    {
+    }
+
+    public void Warning(string text)
+    {
+    }
+
+    public void Error(string text)
+    {
+        Console.Error.WriteLine(text);
+    }
+
+    public void Success(string text)
+    {
+    }
 }

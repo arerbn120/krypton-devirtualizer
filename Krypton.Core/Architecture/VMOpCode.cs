@@ -49,7 +49,9 @@ namespace Krypton.Core.Architecture
         Sub,
         Newarr,
         Newobj,
+        Unbox_Any,
         Ret,
-        Leave
+        Leave,
+        EndFinally
     }
 }

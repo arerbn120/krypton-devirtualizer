@@ -203,6 +203,56 @@ namespace Krypton.Core.PatternMatching.Patterns
             return false;
         }
 
+        public static bool CallsMethodWithSignatureOnType(
+            CilInstruction instruction,
+            string declaringTypeName,
+            string returnTypeFullName,
+            params string[] parameterTypeFullNames)
+        {
+            if (instruction == null)
+                return false;
+            if (instruction.OpCode != CilOpCodes.Call && instruction.OpCode != CilOpCodes.Callvirt)
+                return false;
+            if (!(instruction.Operand is IMethodDescriptor descriptor))
+                return false;
+
+            var declaringType = descriptor.DeclaringType?.FullName ?? descriptor.Resolve()?.DeclaringType?.FullName;
+            if (string.IsNullOrEmpty(declaringType) ||
+                !string.Equals(declaringType, declaringTypeName, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            return CalleeHasSignature(instruction, returnTypeFullName, parameterTypeFullNames);
+        }
+
+        public static bool ContainsMethodCallWithSignatureOnType(
+            IReadOnlyList<CilInstruction> instructions,
+            int startIndex,
+            int maxDistance,
+            string declaringTypeName,
+            string returnTypeFullName,
+            params string[] parameterTypeFullNames)
+        {
+            var end = Math.Min(instructions.Count, startIndex + maxDistance);
+            for (var i = startIndex; i < end; i++)
+            {
+                if (CallsMethodWithSignatureOnType(
+                        instructions[i],
+                        declaringTypeName,
+                        returnTypeFullName,
+                        parameterTypeFullNames))
+                {
+                    return true;
+                }
+
+                if (instructions[i].OpCode == CilOpCodes.Ret)
+                    break;
+            }
+
+            return false;
+        }
+
         public static bool ContainsOpCode(
             IReadOnlyList<CilInstruction> instructions,
             int startIndex,

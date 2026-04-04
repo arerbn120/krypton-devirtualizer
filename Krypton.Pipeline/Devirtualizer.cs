@@ -11,21 +11,81 @@ using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Builder;
 using AsmResolver.PE.DotNet.Cil;
 using Krypton.Core;
+using Krypton.Core.Disassembly;
+using Krypton.Core.Payload;
+using Krypton.Core.Parser;
+using Krypton.Pipeline.Services;
 using Krypton.Pipeline.Stages;
 
 namespace Krypton.Pipeline
 {
     public class Devirtualizer
     {
+        private static readonly string[] StrictAntiTamperStringMarkers =
+        {
+            "is tampered"
+        };
+
+        private static readonly string[] StrictAntiDebuggerStringMarkers =
+        {
+            "Debugger Detected"
+        };
+
+        private static readonly string[] AntiManipulationStringMarkers =
+        {
+            "is tampered",
+            "tampered",
+            "anti tamper",
+            "anti-tamper",
+            "integrity",
+            "checksum",
+            "debugger detected"
+        };
+
+        private static readonly string[] DebuggerApiMarkers =
+        {
+            "System.Diagnostics.Debugger::get_IsAttached",
+            "System.Diagnostics.Debugger::IsAttached",
+            "System.Diagnostics.Debugger::get_IsLogging",
+            "System.Diagnostics.Debugger::IsLogging",
+            "System.Diagnostics.Debugger::Log",
+            "CheckRemoteDebuggerPresent",
+            "IsDebuggerPresent"
+        };
+
+        private static readonly string[] TerminationApiMarkers =
+        {
+            "System.Environment::FailFast",
+            "System.Environment::Exit",
+            "System.Diagnostics.Process::Kill",
+            "System.Windows.Forms.Application::Exit"
+        };
+
         public Devirtualizer(DevirtualizationCtx Ctx)
         {
             this.Ctx = Ctx;
+            var opcodeMapping = new OpcodeMapping();
+            var semanticValidation = new SemanticValidation();
+            var methodRecompiling = new MethodRecompiling();
+
+            Ctx.ResourceReader ??= new ResourceParser();
+            Ctx.ResourceReaders ??= new List<IResourceReader> { Ctx.ResourceReader };
+            Ctx.PayloadParsers ??= new List<IVmPayloadParser> { new LegacyVmPayloadParser() };
+            Ctx.OperandModelExtractors ??= new List<IOperandModelExtractor> { new OperandModelExtractor() };
+            Ctx.DispatcherLocator ??= opcodeMapping;
+            Ctx.OpcodeMapper ??= opcodeMapping;
+            Ctx.InstructionDecoder ??= new VmInstructionDecoder();
+            Ctx.VmSemanticValidator ??= semanticValidation;
+            var semanticValidationStage = Ctx.VmSemanticValidator as IStage ?? semanticValidation;
+            Ctx.CilLowerer ??= methodRecompiling;
+
             Stages = new List<IStage>
             {
                 new ResourceParsing(),
-                new OpcodeMapping(),
+                opcodeMapping,
                 new MethodDisassembling(),
-                new MethodRecompiling(),
+                semanticValidationStage,
+                methodRecompiling,
                 new MethodReplacing()
             };
         }
@@ -51,93 +111,33 @@ namespace Krypton.Pipeline
                 return;
             }
 
-            var reportPath = Path.Combine(
-                Path.GetDirectoryName(Ctx.Options.OutPath)!,
-                Path.GetFileNameWithoutExtension(Ctx.Options.OutPath) + "-report.txt");
+            var reportPath = DevirtualizationReportService.WriteReport(
+                Ctx,
+                FormatInstruction,
+                GetHandlerSnippet);
+            if (!string.IsNullOrWhiteSpace(reportPath))
+                Ctx.Options.Logger.Success($"Wrote report at {reportPath}");
 
-            var sb = new StringBuilder();
-            sb.AppendLine("Krypton Disassembly Report");
-            sb.AppendLine("=========================");
-            sb.AppendLine($"Input: {Ctx.Options.FilePath}");
-            sb.AppendLine($"Methods: {Ctx.VirtualizedMethods.Count}");
-            sb.AppendLine();
-
-            foreach (var method in Ctx.VirtualizedMethods)
-            {
-                var resolvedName = method.Parent?.FullName ?? "<unresolved method>";
-                var total = method.MethodBody.Instructions.Count;
-                var mapped = method.MethodBody.Instructions.Count(i => i.OpCode != Core.Architecture.VMOpCode.Nop);
-                var unknownGroups = method.MethodBody.Instructions
-                    .Where(i => i.OpCode == Core.Architecture.VMOpCode.Nop)
-                    .GroupBy(i => i.VmByte)
-                    .OrderByDescending(g => g.Count())
-                    .ThenBy(g => g.Key)
-                    .Select(g => $"0x{g.Key:X2}:{g.Count()}");
-
-                sb.AppendLine($"MethodKey: {method.MethodKey}");
-                sb.AppendLine($"Parent: {resolvedName}");
-                sb.AppendLine($"Locals: {method.MethodBody.Locals.Count} | EH: {method.MethodBody.ExceptionHandlers.Count}");
-                if (method.MethodBody.ExceptionHandlers.Count > 0)
-                {
-                    for (var i = 0; i < method.MethodBody.ExceptionHandlers.Count; i++)
-                    {
-                        var eh = method.MethodBody.ExceptionHandlers[i];
-                        var extra = eh.EHType switch
-                        {
-                            Core.Architecture.VMExceptionHandlerType.Catch => $" catch:{eh.CatchType}",
-                            Core.Architecture.VMExceptionHandlerType.Filter => $" filter:{eh.Filter}",
-                            _ => string.Empty
-                        };
-                        sb.AppendLine(
-                            $"  EH[{i}] try:[{eh.TryStart},{eh.TryEnd}] handler:[{eh.HandlerStart},{eh.HandlerEnd}] type:{eh.EHType}{extra}");
-                    }
-                }
-                sb.AppendLine($"Instructions: {total} | Mapped: {mapped} | Unknown: {total - mapped}");
-                sb.AppendLine($"Unknown VM bytes: {(total == mapped ? "<none>" : string.Join(", ", unknownGroups))}");
-                sb.AppendLine("Used VM bytes (byte -> opcode, operand-type):");
-                foreach (var vmByte in method.MethodBody.Instructions.Select(i => i.VmByte).Distinct().OrderBy(i => i))
-                {
-                    var opcode = Ctx.PatternMatcher.GetOpCodeValue(vmByte);
-                    var operandType = Ctx.Parser.Operands[vmByte];
-                    sb.AppendLine($"  0x{vmByte:X2} -> {opcode}, operand:{operandType}");
-                }
-                sb.AppendLine("Unknown handler snippets:");
-                foreach (var vmByte in method.MethodBody.Instructions
-                             .Where(i => i.OpCode == Core.Architecture.VMOpCode.Nop)
-                             .Select(i => i.VmByte)
-                             .Distinct()
-                             .OrderBy(i => i))
-                {
-                    sb.AppendLine($"  vm 0x{vmByte:X2}:");
-                    foreach (var line in GetHandlerSnippet(vmByte))
-                        sb.AppendLine($"    {line}");
-                }
-                sb.AppendLine("Instructions:");
-                foreach (var instruction in method.MethodBody.Instructions)
-                    sb.AppendLine($"  {FormatInstruction(instruction)}");
-                sb.AppendLine();
-            }
-
-            File.WriteAllText(reportPath, sb.ToString());
-            Ctx.Options.Logger.Success($"Wrote report at {reportPath}");
-
-            var methodsWithUnknown = Ctx.VirtualizedMethods
-                .Where(q => q.MethodBody.Instructions.Any(i => i.OpCode == Core.Architecture.VMOpCode.Nop))
-                .ToList();
-            if (methodsWithUnknown.Count > 0)
+            var outputDecision = OutputEligibilityService.Evaluate(Ctx);
+            if (outputDecision.MethodsWithUnknownCount > 0)
             {
                 Ctx.Options.Logger.Warning(
-                    $"Detected unresolved VM opcodes in {methodsWithUnknown.Count} method(s). Writing partial output with only fully recompiled methods replaced.");
+                    $"Detected unresolved VM opcodes in {outputDecision.MethodsWithUnknownCount} method(s). Writing partial output with only fully recompiled methods replaced.");
             }
-
-            var hasRecompiledBodies = Ctx.VirtualizedMethods.Any(q => q.RecompiledBody != null);
-            if (!hasRecompiledBodies)
+            if (!outputDecision.ShouldWriteOutput)
             {
-                Ctx.Options.Logger.Warning("No method was fully recompiled and replaced. Skipping assembly write.");
-                if (File.Exists(Ctx.Options.OutPath))
-                    Ctx.Options.Logger.Warning(
-                        $"Existing file at {Ctx.Options.OutPath} is from an older run and does not reflect current report.");
+                if (!string.IsNullOrWhiteSpace(outputDecision.SkipReason))
+                    Ctx.Options.Logger.Warning(outputDecision.SkipReason);
+                if (outputDecision.RemoveStaleOutput)
+                    RemoveStaleOutputFile("this run does not satisfy output write conditions");
                 return;
+            }
+            if (outputDecision.AllowStabilizationOnly &&
+                !Ctx.VirtualizedMethods.Any(q => q.RecompiledBody != null))
+            {
+                Ctx.Options.Logger.Warning(
+                    "No method was recompiled, but stabilization-only output is enabled. " +
+                    "Applying runtime/anti-tamper stabilizers without method-body replacement.");
             }
 
             if (TryWriteInPlacePatchedAssembly())
@@ -148,11 +148,25 @@ namespace Krypton.Pipeline
 
             Ctx.Options.Logger.Warning(
                 "In-place method patch failed. Skipping full PE rebuild to avoid producing a broken PE layout. " +
-                "Use the unpacked/working base binary (e.g. awesome_msil_Out.exe) as input.");
-            if (File.Exists(Ctx.Options.OutPath))
+                "Use the unpacked/working base binary as input.");
+            RemoveStaleOutputFile("this run could not produce a valid patched output");
+        }
+
+        private void RemoveStaleOutputFile(string reason)
+        {
+            if (!File.Exists(Ctx.Options.OutPath))
+                return;
+
+            try
+            {
+                File.Delete(Ctx.Options.OutPath);
+                Ctx.Options.Logger.Warning(
+                    $"Removed stale output file at {Ctx.Options.OutPath} because {reason}.");
+            }
+            catch
             {
                 Ctx.Options.Logger.Warning(
-                    $"File at {Ctx.Options.OutPath} was not freshly patched in this run and may be stale/unchanged.");
+                    $"Could not remove stale file at {Ctx.Options.OutPath}; it may not reflect current report.");
             }
         }
 
@@ -161,8 +175,16 @@ namespace Krypton.Pipeline
             var methodsToPatch = Ctx.VirtualizedMethods
                 .Where(q => q.Parent != null && q.RecompiledBody != null)
                 .ToList();
-            if (methodsToPatch.Count == 0)
+            var allowStabilizationOnlyOutput = GetFeatureToggle(
+                "KRYPTON_ALLOW_STABILIZATION_ONLY_OUTPUT",
+                defaultEnabled: false);
+            if (methodsToPatch.Count == 0 && !allowStabilizationOnlyOutput)
                 return false;
+            if (methodsToPatch.Count == 0 && allowStabilizationOnlyOutput)
+            {
+                Ctx.Options.Logger.Info(
+                    "Proceeding without method-body patches because stabilization-only output is enabled.");
+            }
 
             var tempPath = Path.Combine(
                 Path.GetDirectoryName(Ctx.Options.OutPath)!,
@@ -198,6 +220,85 @@ namespace Krypton.Pipeline
                     {
                         Ctx.Options.Logger.Warning(
                             $"Bypassed {bypassedFormGuards} Windows Forms anti-tamper entry guard(s).");
+                    }
+                }
+
+                var enableStrictAntiManipulationPatch = GetFeatureToggle(
+                    "KRYPTON_ENABLE_STRICT_ANTI_MANIPULATION_PATCH",
+                    defaultEnabled: true,
+                    disableVariableName: "KRYPTON_DISABLE_STRICT_ANTI_MANIPULATION_PATCH");
+                if (enableStrictAntiManipulationPatch)
+                {
+                    var strictTamperPatched = NeutralizeStrictMarkerGuards(
+                        Ctx.Module,
+                        StrictAntiTamperStringMarkers,
+                        requireDebuggerSignal: false);
+                    var strictDebuggerPatched = NeutralizeStrictMarkerGuards(
+                        Ctx.Module,
+                        StrictAntiDebuggerStringMarkers,
+                        requireDebuggerSignal: true);
+                    var strictTotalPatched = strictTamperPatched + strictDebuggerPatched;
+                    if (strictTotalPatched > 0)
+                    {
+                        Ctx.Options.Logger.Warning(
+                            $"Neutralized {strictTotalPatched} strict marker-based anti-manipulation method(s) " +
+                            $"(anti-tamper={strictTamperPatched}, anti-debugger={strictDebuggerPatched}).");
+                    }
+                }
+
+                var enableStringAntiManipulationPatch = GetFeatureToggle(
+                    "KRYPTON_ENABLE_STRING_ANTI_MANIPULATION_PATCH",
+                    defaultEnabled: false,
+                    disableVariableName: "KRYPTON_DISABLE_STRING_ANTI_MANIPULATION_PATCH");
+                if (enableStringAntiManipulationPatch)
+                {
+                    var patchedAntiManipulationMethods = NeutralizeStringSignatureAntiManipulationMethods(Ctx.Module);
+                    if (patchedAntiManipulationMethods > 0)
+                    {
+                        Ctx.Options.Logger.Warning(
+                            $"Neutralized {patchedAntiManipulationMethods} anti-manipulation method(s) using string/API heuristics.");
+                    }
+                }
+
+                var enableTamperThrowNeutralize = GetFeatureToggle(
+                    "KRYPTON_ENABLE_TAMPER_THROW_NEUTRALIZE",
+                    defaultEnabled: false,
+                    disableVariableName: "KRYPTON_DISABLE_TAMPER_THROW_NEUTRALIZE");
+                if (enableTamperThrowNeutralize)
+                {
+                    var patchedTamperThrowers = NeutralizeTamperedExceptionThrowers(Ctx.Module);
+                    if (patchedTamperThrowers > 0)
+                    {
+                        Ctx.Options.Logger.Warning(
+                            $"Neutralized {patchedTamperThrowers} tamper-throw guard method(s).");
+                    }
+                }
+
+                var enableStartupAntiTamperNeutralize = GetFeatureToggle(
+                    "KRYPTON_ENABLE_STARTUP_ANTI_TAMPER_NEUTRALIZE",
+                    defaultEnabled: false,
+                    disableVariableName: "KRYPTON_DISABLE_STARTUP_ANTI_TAMPER_NEUTRALIZE");
+                if (enableStartupAntiTamperNeutralize)
+                {
+                    var patchedStartupTamperGuards = NeutralizeStartupAntiTamperGuards(Ctx.Module);
+                    if (patchedStartupTamperGuards > 0)
+                    {
+                        Ctx.Options.Logger.Warning(
+                            $"Neutralized {patchedStartupTamperGuards} startup anti-tamper guard method(s) reachable from static constructors.");
+                    }
+                }
+
+                var enableTokenDeobfuscationPatch = GetFeatureToggle(
+                    "KRYPTON_ENABLE_TOKEN_DEOBFUSCATION_PATCH",
+                    defaultEnabled: true,
+                    disableVariableName: "KRYPTON_DISABLE_TOKEN_DEOBFUSCATION_PATCH");
+                if (enableTokenDeobfuscationPatch)
+                {
+                    var tokenPatches = DeobfuscateTokenResolverCalls(Ctx.Module);
+                    if (tokenPatches > 0)
+                    {
+                        Ctx.Options.Logger.Info(
+                            $"Token deobfuscation patch replaced {tokenPatches} ldc.i4+call wrapper sequence(s) with ldtoken.");
                     }
                 }
 
@@ -255,44 +356,37 @@ namespace Krypton.Pipeline
                             $"Neutralized {neutralizedWorkers} shared bootstrap worker method(s) referenced by multiple static constructors.");
                     }
                 }
-                var repairedTypeRefs = RepairInvalidTypeReferences(Ctx.Module, Ctx.Options.FilePath);
-                if (repairedTypeRefs > 0)
+                var enableTypeRefRepair = GetFeatureToggle(
+                    "KRYPTON_ENABLE_TYPEREF_REPAIR",
+                    defaultEnabled: true,
+                    disableVariableName: "KRYPTON_DISABLE_TYPEREF_REPAIR");
+                var repairedTypeRefs = 0;
+                if (enableTypeRefRepair)
                 {
-                    Ctx.Options.Logger.Warning(
-                        $"Repaired {repairedTypeRefs} invalid type reference scope(s) before donor write.");
-                }
-                NormalizeAssemblyIdentity(Ctx.Module);
-                try
-                {
-                    Ctx.Module.Write(
-                        tempPath,
-                        new ManagedPEImageBuilder(new DotNetDirectoryFactory(metadataBuilderFlags)));
-                }
-                catch (Exception ex) when (!stripMalformedAttributes)
-                {
-                    Ctx.Options.Logger.Warning(
-                        $"Temporary donor write failed without attribute stripping ({ex.Message}). Retrying with malformed-attribute cleanup.");
-                    var removed = StripMalformedCustomAttributes(Ctx.Module);
-                    if (removed > 0)
-                        Ctx.Options.Logger.Warning($"Removed {removed} malformed custom attributes before retry donor write.");
-                    try
-                    {
-                        Ctx.Module.Write(
-                            tempPath,
-                            new ManagedPEImageBuilder(new DotNetDirectoryFactory(metadataBuilderFlags)));
-                    }
-                    catch (Exception retryEx)
+                    repairedTypeRefs = RepairInvalidTypeReferences(Ctx.Module, Ctx.Options.FilePath);
+                    if (repairedTypeRefs > 0)
                     {
                         Ctx.Options.Logger.Warning(
-                            $"Retry donor write after malformed-attribute cleanup failed ({retryEx.Message}). Retrying with full custom-attribute strip.");
-                        var cleared = ClearAllCustomAttributes(Ctx.Module);
-                        if (cleared > 0)
-                            Ctx.Options.Logger.Warning($"Removed {cleared} custom attributes before final donor write retry.");
-                        Ctx.Module.Write(
-                            tempPath,
-                            new ManagedPEImageBuilder(new DotNetDirectoryFactory(metadataBuilderFlags)));
+                            $"Repaired {repairedTypeRefs} invalid type reference scope(s) before donor write.");
                     }
                 }
+
+                var enableDeadInstructionSanitize = GetFeatureToggle(
+                    "KRYPTON_ENABLE_DEAD_INSTRUCTION_SANITIZE",
+                    defaultEnabled: true,
+                    disableVariableName: "KRYPTON_DISABLE_DEAD_INSTRUCTION_SANITIZE");
+                var sanitizedDeadInstructions = 0;
+                if (enableDeadInstructionSanitize)
+                {
+                    sanitizedDeadInstructions = SanitizeUnreachableInvalidInstructions(Ctx.Module);
+                    if (sanitizedDeadInstructions > 0)
+                    {
+                        Ctx.Options.Logger.Warning(
+                            $"Sanitized {sanitizedDeadInstructions} unreachable invalid instruction(s) before donor write.");
+                    }
+                }
+                NormalizeAssemblyIdentity(Ctx.Module);
+                WriteTemporaryDonorImage(tempPath, metadataBuilderFlags, stripMalformedAttributes, methodsToPatch);
 
                 var useRewriteOutput = !string.Equals(
                     Environment.GetEnvironmentVariable("KRYPTON_USE_INPLACE_PATCH"),
@@ -400,6 +494,236 @@ namespace Krypton.Pipeline
                     }
                 }
             }
+        }
+
+        private void WriteTemporaryDonorImage(
+            string tempPath,
+            MetadataBuilderFlags metadataBuilderFlags,
+            bool stripMalformedAttributes,
+            IReadOnlyCollection<Core.Architecture.VMMethod> methodsToPatch)
+        {
+            void WriteDonor()
+            {
+                Ctx.Module.Write(
+                    tempPath,
+                    new ManagedPEImageBuilder(new DotNetDirectoryFactory(metadataBuilderFlags)));
+            }
+
+            Exception initialWriteError = null;
+            try
+            {
+                WriteDonor();
+                return;
+            }
+            catch (Exception ex)
+            {
+                initialWriteError = ex;
+            }
+
+            if (TryRelaxStackValidationOnWriteFailure(initialWriteError, methodsToPatch))
+            {
+                try
+                {
+                    WriteDonor();
+                    return;
+                }
+                catch (Exception relaxedRetryError)
+                {
+                    initialWriteError = relaxedRetryError;
+                }
+            }
+
+            if (stripMalformedAttributes)
+                throw initialWriteError;
+
+            Ctx.Options.Logger.Warning(
+                $"Temporary donor write failed without attribute stripping ({initialWriteError.Message}). Retrying with malformed-attribute cleanup.");
+            var removed = StripMalformedCustomAttributes(Ctx.Module);
+            if (removed > 0)
+                Ctx.Options.Logger.Warning($"Removed {removed} malformed custom attributes before retry donor write.");
+            try
+            {
+                WriteDonor();
+            }
+            catch (Exception retryEx)
+            {
+                Ctx.Options.Logger.Warning(
+                    $"Retry donor write after malformed-attribute cleanup failed ({retryEx.Message}). Retrying with full custom-attribute strip.");
+                var cleared = ClearAllCustomAttributes(Ctx.Module);
+                if (cleared > 0)
+                    Ctx.Options.Logger.Warning($"Removed {cleared} custom attributes before final donor write retry.");
+                WriteDonor();
+            }
+        }
+
+        private bool TryRelaxStackValidationOnWriteFailure(
+            Exception writeError,
+            IReadOnlyCollection<Core.Architecture.VMMethod> methodsToPatch)
+        {
+            if (!IsStackImbalanceWriteFailure(writeError))
+                return false;
+
+            var relaxed = 0;
+            foreach (var vmMethod in methodsToPatch)
+            {
+                var body = vmMethod?.Parent?.CilMethodBody;
+                if (body == null)
+                    continue;
+
+                var changed = false;
+                if (body.ComputeMaxStackOnBuild)
+                {
+                    body.ComputeMaxStackOnBuild = false;
+                    changed = true;
+                }
+
+                if (body.VerifyLabelsOnBuild)
+                {
+                    body.VerifyLabelsOnBuild = false;
+                    changed = true;
+                }
+
+                var relaxedFlags = body.BuildFlags &
+                                   ~(CilMethodBodyBuildFlags.ComputeMaxStack |
+                                     CilMethodBodyBuildFlags.VerifyLabels |
+                                     CilMethodBodyBuildFlags.FullValidation);
+                if (relaxedFlags != body.BuildFlags)
+                {
+                    body.BuildFlags = relaxedFlags;
+                    changed = true;
+                }
+
+                if (body.MaxStack < 64)
+                {
+                    body.MaxStack = 64;
+                    changed = true;
+                }
+
+                if (changed)
+                    relaxed++;
+            }
+
+            if (relaxed <= 0)
+                return false;
+
+            Ctx.Options.Logger.Warning(
+                $"Detected stack validation failure while writing donor image. Relaxed max-stack computation for {relaxed} method(s) and retrying.");
+            return true;
+        }
+
+        private bool IsStackImbalanceWriteFailure(Exception error)
+        {
+            if (error == null)
+                return false;
+
+            return error.ToString().IndexOf("Stack imbalance was detected", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private int SanitizeUnreachableInvalidInstructions(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            if (module == null)
+                return 0;
+
+            var sanitized = 0;
+            foreach (var type in module.GetAllTypes())
+            {
+                foreach (var method in type.Methods)
+                {
+                    var body = method?.CilMethodBody;
+                    if (body?.Instructions == null || body.Instructions.Count == 0)
+                        continue;
+
+                    var reachable = GetReachableInstructionIndices(body);
+                    for (var i = 0; i < body.Instructions.Count; i++)
+                    {
+                        if (reachable.Contains(i))
+                            continue;
+
+                        var instruction = body.Instructions[i];
+                        if (!RequiresOperand(instruction.OpCode) || instruction.Operand != null)
+                            continue;
+
+                        instruction.OpCode = CilOpCodes.Nop;
+                        instruction.Operand = null;
+                        sanitized++;
+                    }
+                }
+            }
+
+            return sanitized;
+        }
+
+        private HashSet<int> GetReachableInstructionIndices(CilMethodBody body)
+        {
+            var reachable = new HashSet<int>();
+            var worklist = new Stack<int>();
+            var instructionIndexByInstruction = new Dictionary<CilInstruction, int>(body.Instructions.Count);
+            for (var i = 0; i < body.Instructions.Count; i++)
+                instructionIndexByInstruction[body.Instructions[i]] = i;
+
+            worklist.Push(0);
+            while (worklist.Count > 0)
+            {
+                var index = worklist.Pop();
+                if (index < 0 || index >= body.Instructions.Count || !reachable.Add(index))
+                    continue;
+
+                var instruction = body.Instructions[index];
+                switch (instruction.OpCode.Code)
+                {
+                    case CilCode.Br:
+                    case CilCode.Leave:
+                        PushReachableTarget(worklist, instruction.Operand, instructionIndexByInstruction);
+                        break;
+
+                    case CilCode.Brtrue:
+                    case CilCode.Brfalse:
+                    case CilCode.Blt_Un:
+                    case CilCode.Bge_Un:
+                        PushReachableTarget(worklist, instruction.Operand, instructionIndexByInstruction);
+                        worklist.Push(index + 1);
+                        break;
+
+                    case CilCode.Switch:
+                        if (instruction.Operand is IList<ICilLabel> labels)
+                        {
+                            foreach (var label in labels)
+                                PushReachableTarget(worklist, label, instructionIndexByInstruction);
+                        }
+
+                        worklist.Push(index + 1);
+                        break;
+
+                    case CilCode.Ret:
+                    case CilCode.Endfinally:
+                        break;
+
+                    default:
+                        worklist.Push(index + 1);
+                        break;
+                }
+            }
+
+            return reachable;
+        }
+
+        private void PushReachableTarget(
+            Stack<int> worklist,
+            object operand,
+            IReadOnlyDictionary<CilInstruction, int> instructionIndexByInstruction)
+        {
+            if (!(operand is CilInstructionLabel label) || label.Instruction == null)
+                return;
+            if (!instructionIndexByInstruction.TryGetValue(label.Instruction, out var targetIndex))
+                return;
+
+            worklist.Push(targetIndex);
+        }
+
+        private bool RequiresOperand(CilOpCode opCode)
+        {
+            return opCode.Code != CilCode.Nop &&
+                   opCode.OperandType != CilOperandType.InlineNone;
         }
 
         private Dictionary<uint, int> BuildMethodBodyCapacities(
@@ -1550,6 +1874,772 @@ namespace Krypton.Pipeline
                    string.Equals(signature.ReturnType?.FullName, "System.Boolean", StringComparison.Ordinal) &&
                    signature.ParameterTypes.Count == 1 &&
                    string.Equals(signature.ParameterTypes[0].FullName, "System.Int32", StringComparison.Ordinal);
+        }
+
+        private int NeutralizeStrictMarkerGuards(
+            AsmResolver.DotNet.ModuleDefinition module,
+            IReadOnlyCollection<string> markerStrings,
+            bool requireDebuggerSignal)
+        {
+            if (module == null || markerStrings == null || markerStrings.Count == 0)
+                return 0;
+
+            var patched = 0;
+            foreach (var type in module.GetAllTypes())
+            {
+                foreach (var method in type.Methods)
+                {
+                    if (!LooksLikeStrictMarkerGuard(method, markerStrings, requireDebuggerSignal))
+                        continue;
+                    if (!TryReplaceWithRetOnlyStub(method))
+                        continue;
+
+                    patched++;
+                }
+            }
+
+            return patched;
+        }
+
+        private bool LooksLikeStrictMarkerGuard(
+            AsmResolver.DotNet.MethodDefinition method,
+            IReadOnlyCollection<string> markerStrings,
+            bool requireDebuggerSignal)
+        {
+            if (method?.CilMethodBody == null || !method.IsStatic)
+                return false;
+            if (string.Equals(method.Name, ".cctor", StringComparison.Ordinal))
+                return false;
+
+            var signature = method.Signature;
+            if (signature == null)
+                return false;
+            if (!string.Equals(signature.ReturnType?.FullName, "System.Void", StringComparison.Ordinal))
+                return false;
+            if (signature.ParameterTypes.Count != 0)
+                return false;
+
+            var body = method.CilMethodBody;
+            if (body.Instructions.Count == 0 || body.Instructions.Count > 4096)
+                return false;
+
+            var hasMarker = false;
+            var hasDebuggerApi = false;
+            var hasTerminationApi = false;
+            var hasThrow = false;
+
+            foreach (var instruction in body.Instructions)
+            {
+                if (!hasMarker &&
+                    instruction.OpCode.Code == CilCode.Ldstr &&
+                    instruction.Operand != null &&
+                    ContainsAnyToken(SafeStringify(instruction.Operand), markerStrings))
+                {
+                    hasMarker = true;
+                }
+
+                if (instruction.OpCode.Code == CilCode.Call || instruction.OpCode.Code == CilCode.Callvirt)
+                {
+                    var methodIdentity = GetMethodIdentity(instruction.Operand as IMethodDescriptor);
+                    if (!hasDebuggerApi && ContainsAnyToken(methodIdentity, DebuggerApiMarkers))
+                        hasDebuggerApi = true;
+                    if (!hasTerminationApi && ContainsAnyToken(methodIdentity, TerminationApiMarkers))
+                        hasTerminationApi = true;
+                }
+
+                if (!hasThrow &&
+                    (instruction.OpCode.Code == CilCode.Throw || instruction.OpCode.Code == CilCode.Rethrow))
+                {
+                    hasThrow = true;
+                }
+
+                if (hasMarker &&
+                    (hasDebuggerApi || hasTerminationApi || hasThrow) &&
+                    (!requireDebuggerSignal || hasDebuggerApi))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private bool TryReplaceWithRetOnlyStub(AsmResolver.DotNet.MethodDefinition method)
+        {
+            var signature = method?.Signature;
+            if (signature == null)
+                return false;
+            if (!string.Equals(signature.ReturnType?.FullName, "System.Void", StringComparison.Ordinal))
+                return false;
+            if (signature.ParameterTypes.Count != 0)
+                return false;
+
+            var replacement = new CilMethodBody(method)
+            {
+                InitializeLocals = false,
+                ComputeMaxStackOnBuild = true,
+                MaxStack = 1
+            };
+            replacement.Instructions.Add(new CilInstruction(CilOpCodes.Ret));
+            method.CilMethodBody = replacement;
+            return true;
+        }
+
+        private int DeobfuscateTokenResolverCalls(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            if (module == null)
+                return 0;
+
+            var resolverMethods = FindTokenResolverMethods(module);
+            if (resolverMethods == null)
+                return 0;
+
+            var patched = 0;
+            foreach (var type in module.GetAllTypes())
+            {
+                foreach (var method in type.Methods)
+                {
+                    var body = method.CilMethodBody;
+                    if (body == null || body.Instructions.Count < 2)
+                        continue;
+
+                    for (var i = 0; i < body.Instructions.Count - 1; i++)
+                    {
+                        if (!TryGetLdcI4Value(body.Instructions[i], out var token))
+                            continue;
+
+                        var call = body.Instructions[i + 1];
+                        if (call.OpCode.Code != CilCode.Call && call.OpCode.Code != CilCode.Callvirt)
+                            continue;
+                        if (!(call.Operand is IMethodDescriptor calledDescriptor))
+                            continue;
+
+                        AsmResolver.DotNet.MethodDefinition calledMethod;
+                        try
+                        {
+                            calledMethod = calledDescriptor.Resolve();
+                        }
+                        catch
+                        {
+                            continue;
+                        }
+
+                        if (calledMethod == null)
+                            continue;
+
+                        var expectsTypeToken = false;
+                        if (ReferenceEquals(calledMethod, resolverMethods.TypeResolver))
+                        {
+                            expectsTypeToken = true;
+                        }
+                        else if (!ReferenceEquals(calledMethod, resolverMethods.FieldResolver))
+                        {
+                            continue;
+                        }
+
+                        if (!TryResolveLdtokenOperand(module, token, expectsTypeToken, out var ldtokenOperand))
+                            continue;
+
+                        body.Instructions[i].OpCode = CilOpCodes.Nop;
+                        body.Instructions[i].Operand = null;
+                        body.Instructions[i + 1].OpCode = CilOpCodes.Ldtoken;
+                        body.Instructions[i + 1].Operand = ldtokenOperand;
+                        patched++;
+                        i++;
+                    }
+                }
+            }
+
+            return patched;
+        }
+
+        private TokenResolverMethods FindTokenResolverMethods(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            foreach (var type in module.GetAllTypes())
+            {
+                var hasModuleHandleField = type.Fields.Any(field =>
+                {
+                    var fieldTypeName = field.Signature?.FieldType?.FullName;
+                    return string.Equals(fieldTypeName, "System.ModuleHandle", StringComparison.Ordinal);
+                });
+                if (!hasModuleHandleField)
+                    continue;
+
+                AsmResolver.DotNet.MethodDefinition typeResolver = null;
+                AsmResolver.DotNet.MethodDefinition fieldResolver = null;
+
+                foreach (var method in type.Methods)
+                {
+                    var signature = method.Signature;
+                    if (signature == null || signature.ParameterTypes.Count != 1)
+                        continue;
+                    if (!string.Equals(signature.ParameterTypes[0].FullName, "System.Int32", StringComparison.Ordinal))
+                        continue;
+
+                    var returnTypeName = signature.ReturnType?.FullName;
+                    if (string.Equals(returnTypeName, "System.RuntimeTypeHandle", StringComparison.Ordinal))
+                        typeResolver = method;
+                    else if (string.Equals(returnTypeName, "System.RuntimeFieldHandle", StringComparison.Ordinal))
+                        fieldResolver = method;
+                }
+
+                if (typeResolver != null && fieldResolver != null)
+                    return new TokenResolverMethods(typeResolver, fieldResolver);
+            }
+
+            return null;
+        }
+
+        private bool TryGetLdcI4Value(CilInstruction instruction, out int value)
+        {
+            value = 0;
+            if (instruction == null)
+                return false;
+
+            switch (instruction.OpCode.Code)
+            {
+                case CilCode.Ldc_I4_M1:
+                    value = -1;
+                    return true;
+                case CilCode.Ldc_I4_0:
+                    value = 0;
+                    return true;
+                case CilCode.Ldc_I4_1:
+                    value = 1;
+                    return true;
+                case CilCode.Ldc_I4_2:
+                    value = 2;
+                    return true;
+                case CilCode.Ldc_I4_3:
+                    value = 3;
+                    return true;
+                case CilCode.Ldc_I4_4:
+                    value = 4;
+                    return true;
+                case CilCode.Ldc_I4_5:
+                    value = 5;
+                    return true;
+                case CilCode.Ldc_I4_6:
+                    value = 6;
+                    return true;
+                case CilCode.Ldc_I4_7:
+                    value = 7;
+                    return true;
+                case CilCode.Ldc_I4_8:
+                    value = 8;
+                    return true;
+                case CilCode.Ldc_I4_S:
+                    if (instruction.Operand is sbyte signedByte)
+                    {
+                        value = signedByte;
+                        return true;
+                    }
+
+                    if (instruction.Operand is byte unsignedByte)
+                    {
+                        value = (sbyte) unsignedByte;
+                        return true;
+                    }
+
+                    if (instruction.Operand is int intValueS)
+                    {
+                        value = intValueS;
+                        return true;
+                    }
+
+                    return false;
+                case CilCode.Ldc_I4:
+                    if (instruction.Operand is int intValue)
+                    {
+                        value = intValue;
+                        return true;
+                    }
+
+                    if (instruction.Operand is uint uintValue)
+                    {
+                        value = unchecked((int) uintValue);
+                        return true;
+                    }
+
+                    return false;
+                default:
+                    return false;
+            }
+        }
+
+        private bool TryResolveLdtokenOperand(
+            AsmResolver.DotNet.ModuleDefinition module,
+            int token,
+            bool expectTypeToken,
+            out object operand)
+        {
+            operand = null;
+            if (module == null || token <= 0)
+                return false;
+
+            object member;
+            try
+            {
+                member = module.LookupMember(token);
+            }
+            catch
+            {
+                return false;
+            }
+
+            if (member == null)
+                return false;
+
+            if (expectTypeToken)
+            {
+                if (member is AsmResolver.DotNet.ITypeDefOrRef typeDefOrRef)
+                {
+                    operand = typeDefOrRef;
+                    return true;
+                }
+
+                if (member is AsmResolver.DotNet.ITypeDescriptor typeDescriptor)
+                {
+                    operand = typeDescriptor;
+                    return true;
+                }
+
+                return false;
+            }
+
+            if (member is IFieldDescriptor fieldDescriptor)
+            {
+                operand = fieldDescriptor;
+                return true;
+            }
+
+            return false;
+        }
+
+        private sealed class TokenResolverMethods
+        {
+            public TokenResolverMethods(
+                AsmResolver.DotNet.MethodDefinition typeResolver,
+                AsmResolver.DotNet.MethodDefinition fieldResolver)
+            {
+                TypeResolver = typeResolver;
+                FieldResolver = fieldResolver;
+            }
+
+            public AsmResolver.DotNet.MethodDefinition TypeResolver { get; }
+            public AsmResolver.DotNet.MethodDefinition FieldResolver { get; }
+        }
+
+        private int NeutralizeStringSignatureAntiManipulationMethods(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            var patched = 0;
+            foreach (var type in module.GetAllTypes())
+            {
+                foreach (var method in type.Methods)
+                {
+                    if (!LooksLikeAntiManipulationMethod(method))
+                        continue;
+                    if (!TryReplaceWithSafeReturnStub(method))
+                        continue;
+
+                    patched++;
+                }
+            }
+
+            return patched;
+        }
+
+        private bool LooksLikeAntiManipulationMethod(AsmResolver.DotNet.MethodDefinition method)
+        {
+            if (method?.CilMethodBody == null || !method.IsStatic)
+                return false;
+            if (string.Equals(method.Name, ".cctor", StringComparison.Ordinal))
+                return false;
+
+            var signature = method.Signature;
+            var returnTypeName = signature?.ReturnType?.FullName;
+            if (string.IsNullOrEmpty(returnTypeName))
+                return false;
+            if (returnTypeName.EndsWith("&", StringComparison.Ordinal))
+                return false;
+
+            var body = method.CilMethodBody;
+            if (body.Instructions.Count == 0)
+                return false;
+            if (body.Instructions.Count > 1024)
+                return false;
+
+            var hasMarkerString = false;
+            var hasDebuggerApi = false;
+            var hasTerminationApi = false;
+            foreach (var instruction in body.Instructions)
+            {
+                if (instruction.OpCode.Code == CilCode.Ldstr &&
+                    instruction.Operand != null &&
+                    ContainsAnyToken(SafeStringify(instruction.Operand), AntiManipulationStringMarkers))
+                {
+                    hasMarkerString = true;
+                }
+
+                if (instruction.OpCode.Code == CilCode.Call || instruction.OpCode.Code == CilCode.Callvirt)
+                {
+                    var methodIdentity = GetMethodIdentity(instruction.Operand as IMethodDescriptor);
+                    if (!hasDebuggerApi && ContainsAnyToken(methodIdentity, DebuggerApiMarkers))
+                        hasDebuggerApi = true;
+                    if (!hasTerminationApi && ContainsAnyToken(methodIdentity, TerminationApiMarkers))
+                        hasTerminationApi = true;
+                }
+
+                if (hasMarkerString || (hasDebuggerApi && hasTerminationApi))
+                    break;
+            }
+
+            if (hasMarkerString)
+                return true;
+
+            if (!hasDebuggerApi || !hasTerminationApi)
+                return false;
+
+            return string.Equals(returnTypeName, "System.Void", StringComparison.Ordinal) ||
+                   string.Equals(returnTypeName, "System.Boolean", StringComparison.Ordinal) ||
+                   string.Equals(returnTypeName, "System.Int32", StringComparison.Ordinal);
+        }
+
+        private bool TryReplaceWithSafeReturnStub(AsmResolver.DotNet.MethodDefinition method)
+        {
+            var signature = method?.Signature;
+            if (signature == null)
+                return false;
+
+            var returnType = signature.ReturnType;
+            if (returnType?.FullName != null && returnType.FullName.EndsWith("&", StringComparison.Ordinal))
+                return false;
+
+            var replacement = new CilMethodBody(method)
+            {
+                InitializeLocals = true,
+                ComputeMaxStackOnBuild = true,
+                MaxStack = 1
+            };
+
+            if (!string.Equals(returnType?.FullName, "System.Void", StringComparison.Ordinal))
+            {
+                replacement.LocalVariables.Add(new CilLocalVariable(returnType));
+                replacement.Instructions.Add(new CilInstruction(CilOpCodes.Ldloc_0));
+            }
+
+            replacement.Instructions.Add(new CilInstruction(CilOpCodes.Ret));
+            method.CilMethodBody = replacement;
+            return true;
+        }
+
+        private int NeutralizeTamperedExceptionThrowers(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            if (module == null)
+                return 0;
+
+            var patched = 0;
+            foreach (var type in module.GetAllTypes())
+            {
+                foreach (var method in type.Methods)
+                {
+                    if (!LooksLikeTamperedExceptionThrower(method))
+                        continue;
+                    if (!TryReplaceWithSafeReturnStub(method))
+                        continue;
+                    patched++;
+                }
+            }
+
+            return patched;
+        }
+
+        private bool LooksLikeTamperedExceptionThrower(AsmResolver.DotNet.MethodDefinition method)
+        {
+            var body = method?.CilMethodBody;
+            if (body == null)
+                return false;
+            if (body.Instructions.Count == 0 || body.Instructions.Count > 8192)
+                return false;
+
+            var hasTamperMarker = false;
+            var hasThrow = false;
+            var hasExceptionCtor = false;
+
+            foreach (var instruction in body.Instructions)
+            {
+                if (!hasTamperMarker &&
+                    instruction.OpCode.Code == CilCode.Ldstr &&
+                    instruction.Operand != null &&
+                    ContainsAnyToken(SafeStringify(instruction.Operand), AntiManipulationStringMarkers))
+                {
+                    hasTamperMarker = true;
+                }
+
+                if (!hasThrow &&
+                    (instruction.OpCode.Code == CilCode.Throw || instruction.OpCode.Code == CilCode.Rethrow))
+                {
+                    hasThrow = true;
+                }
+
+                if (!hasExceptionCtor &&
+                    instruction.OpCode.Code == CilCode.Newobj &&
+                    instruction.Operand is IMethodDescriptor ctor &&
+                    IsExceptionConstructor(ctor))
+                {
+                    hasExceptionCtor = true;
+                }
+
+                if (hasTamperMarker && hasThrow && hasExceptionCtor)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private bool IsExceptionConstructor(IMethodDescriptor descriptor)
+        {
+            if (descriptor == null)
+                return false;
+
+            var identity = GetMethodIdentity(descriptor);
+            if (identity.IndexOf("Exception::.ctor", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+
+            var declaringTypeName = SafeStringify(descriptor.DeclaringType?.FullName);
+            if (declaringTypeName.EndsWith("Exception", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            try
+            {
+                var resolved = descriptor.Resolve();
+                var resolvedDeclaringTypeName = SafeStringify(resolved?.DeclaringType?.FullName);
+                return resolvedDeclaringTypeName.EndsWith("Exception", StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private int NeutralizeStartupAntiTamperGuards(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            if (module == null)
+                return 0;
+
+            var roots = module
+                .GetAllTypes()
+                .SelectMany(t => t.Methods)
+                .Where(m => m != null &&
+                            m.IsStatic &&
+                            string.Equals(m.Name, ".cctor", StringComparison.Ordinal) &&
+                            m.CilMethodBody != null)
+                .ToList();
+            if (roots.Count == 0)
+                return 0;
+
+            var reachable = CollectMethodsReachableFromConstructors(roots, maxDepth: 3);
+            var patched = 0;
+
+            foreach (var method in reachable)
+            {
+                if (method == null || method.CilMethodBody == null)
+                    continue;
+                if (!LooksLikeStartupAntiTamperGuard(method))
+                    continue;
+                if (!TryReplaceWithSafeReturnStub(method))
+                    continue;
+
+                patched++;
+            }
+
+            return patched;
+        }
+
+        private HashSet<AsmResolver.DotNet.MethodDefinition> CollectMethodsReachableFromConstructors(
+            IReadOnlyCollection<AsmResolver.DotNet.MethodDefinition> roots,
+            int maxDepth)
+        {
+            var reachable = new HashSet<AsmResolver.DotNet.MethodDefinition>();
+            var queue = new Queue<(AsmResolver.DotNet.MethodDefinition method, int depth)>();
+
+            foreach (var root in roots)
+                queue.Enqueue((root, 0));
+
+            while (queue.Count > 0)
+            {
+                var (method, depth) = queue.Dequeue();
+                if (method?.CilMethodBody == null)
+                    continue;
+                if (depth >= maxDepth)
+                    continue;
+
+                foreach (var instruction in method.CilMethodBody.Instructions)
+                {
+                    if (instruction.OpCode.Code != CilCode.Call && instruction.OpCode.Code != CilCode.Callvirt)
+                        continue;
+                    if (!(instruction.Operand is IMethodDescriptor calleeDescriptor))
+                        continue;
+
+                    AsmResolver.DotNet.MethodDefinition callee;
+                    try
+                    {
+                        callee = calleeDescriptor.Resolve();
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (callee?.CilMethodBody == null)
+                        continue;
+                    if (!reachable.Add(callee))
+                        continue;
+
+                    queue.Enqueue((callee, depth + 1));
+                }
+            }
+
+            return reachable;
+        }
+
+        private bool LooksLikeStartupAntiTamperGuard(AsmResolver.DotNet.MethodDefinition method)
+        {
+            if (method?.CilMethodBody == null || !method.IsStatic)
+                return false;
+            if (string.Equals(method.Name, ".cctor", StringComparison.Ordinal))
+                return false;
+
+            var signature = method.Signature;
+            var returnTypeName = signature?.ReturnType?.FullName;
+            if (string.IsNullOrEmpty(returnTypeName))
+                return false;
+            if (returnTypeName.EndsWith("&", StringComparison.Ordinal))
+                return false;
+            if (method.CilMethodBody.Instructions.Count == 0 || method.CilMethodBody.Instructions.Count > 32768)
+                return false;
+
+            var hasThrow = false;
+            var hasExceptionCtor = false;
+            var hasMarkerString = false;
+            var hasDebuggerApi = false;
+            var hasTerminationApi = false;
+            var hasSecurityApi = false;
+
+            foreach (var instruction in method.CilMethodBody.Instructions)
+            {
+                if (!hasThrow &&
+                    (instruction.OpCode.Code == CilCode.Throw || instruction.OpCode.Code == CilCode.Rethrow))
+                {
+                    hasThrow = true;
+                }
+
+                if (!hasMarkerString &&
+                    instruction.OpCode.Code == CilCode.Ldstr &&
+                    instruction.Operand != null &&
+                    ContainsAnyToken(SafeStringify(instruction.Operand), AntiManipulationStringMarkers))
+                {
+                    hasMarkerString = true;
+                }
+
+                if (instruction.OpCode.Code == CilCode.Newobj &&
+                    instruction.Operand is IMethodDescriptor ctorDescriptor &&
+                    IsExceptionConstructor(ctorDescriptor))
+                {
+                    hasExceptionCtor = true;
+                }
+
+                if (instruction.OpCode.Code == CilCode.Call || instruction.OpCode.Code == CilCode.Callvirt)
+                {
+                    var methodIdentity = GetMethodIdentity(instruction.Operand as IMethodDescriptor);
+                    if (!hasDebuggerApi && ContainsAnyToken(methodIdentity, DebuggerApiMarkers))
+                        hasDebuggerApi = true;
+                    if (!hasTerminationApi && ContainsAnyToken(methodIdentity, TerminationApiMarkers))
+                        hasTerminationApi = true;
+                    if (!hasSecurityApi && LooksLikeSecurityIntegrityApi(methodIdentity))
+                        hasSecurityApi = true;
+                }
+
+                if (hasThrow && hasExceptionCtor &&
+                    (hasMarkerString || hasDebuggerApi || hasTerminationApi || hasSecurityApi))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private bool LooksLikeSecurityIntegrityApi(string methodIdentity)
+        {
+            if (string.IsNullOrEmpty(methodIdentity))
+                return false;
+
+            return methodIdentity.IndexOf("System.Security", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   methodIdentity.IndexOf("RSACryptoServiceProvider", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   methodIdentity.IndexOf("SHA1", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   methodIdentity.IndexOf("Crypto", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   methodIdentity.IndexOf("GetManifestResource", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   methodIdentity.IndexOf("System.Reflection.Assembly", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   methodIdentity.IndexOf("StrongName", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   methodIdentity.IndexOf("File::Exists", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private bool ContainsAnyToken(string value, IEnumerable<string> tokens)
+        {
+            if (string.IsNullOrEmpty(value))
+                return false;
+
+            foreach (var token in tokens)
+            {
+                if (string.IsNullOrWhiteSpace(token))
+                    continue;
+                if (value.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private string GetMethodIdentity(IMethodDescriptor descriptor)
+        {
+            if (descriptor == null)
+                return string.Empty;
+
+            AsmResolver.DotNet.MethodDefinition resolved = null;
+            try
+            {
+                resolved = descriptor.Resolve();
+            }
+            catch
+            {
+                // Malformed metadata can fail resolution; fallback below still provides useful identity.
+            }
+
+            var declaringTypeName = SafeStringify(descriptor.DeclaringType?.FullName);
+            if (string.IsNullOrEmpty(declaringTypeName))
+                declaringTypeName = SafeStringify(resolved?.DeclaringType?.FullName);
+
+            var methodName = SafeStringify(descriptor.Name);
+            if (string.IsNullOrEmpty(methodName))
+                methodName = SafeStringify(resolved?.Name);
+
+            return declaringTypeName + "::" + methodName;
+        }
+
+        private string SafeStringify(object value)
+        {
+            if (value == null)
+                return string.Empty;
+
+            try
+            {
+                return value.ToString() ?? string.Empty;
+            }
+            catch
+            {
+                return string.Empty;
+            }
         }
 
         private IEnumerable<AsmResolver.DotNet.TypeDefinition> GetBootstrapCandidateTypes(
