@@ -407,6 +407,7 @@ namespace Krypton.Pipeline.Stages
                 case CilCode.Ldc_R8:
                 case CilCode.Ldstr:
                 case CilCode.Ldnull:
+                case CilCode.Ldtoken:
                 case CilCode.Ldsfld:
                     push = 1;
                     return true;

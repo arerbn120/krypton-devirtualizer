@@ -520,6 +520,7 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.Conv_I8:
                 case VMOpCode.Conv_U1:
                 case VMOpCode.Ldnull:
+                case VMOpCode.Ldtoken:
                 case VMOpCode.Ret:
                     return true;
                 default:
@@ -643,6 +644,7 @@ namespace Krypton.Pipeline.Stages
                 return;
 
             var instructions = ctx.OpcodeHandlerMethod.CilMethodBody.Instructions;
+            var operandObservations = CollectOperandObservations(ctx);
             var inferred = 0;
 
             foreach (var pair in ctx.OpcodeHandlerIndices.OrderBy(p => p.Key))
@@ -651,6 +653,8 @@ namespace Krypton.Pipeline.Stages
                 if (ctx.PatternMatcher.IsOpCodeValueKnown(vmByte))
                     continue;
                 if (vmByte < 0 || vmByte >= ctx.Parser.Operands.Length || ctx.Parser.Operands[vmByte] != 1)
+                    continue;
+                if (operandObservations.TryGetValue(vmByte, out var obs) && obs.PrivateImplDetailFieldCount > 0)
                     continue;
                 if (!LooksLikeStelemI1Handler(ctx, instructions, pair.Value))
                     continue;
@@ -984,6 +988,7 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.BrTrue:
                 case VMOpCode.BrFalse:
                 case VMOpCode.BrLessThan:
+                case VMOpCode.Leave:
                     return operand is int branchTarget &&
                            branchTarget >= 0 &&
                            branchTarget < stream.Instructions.Count;
@@ -1095,6 +1100,10 @@ namespace Krypton.Pipeline.Stages
 
         private void InferUnknownByNeighborContext(DevirtualizationCtx ctx)
         {
+            var strict = IsStrictMappingMode();
+            if (strict && !IsEnvironmentEnabled("KRYPTON_ENABLE_NEIGHBOR_CONTEXT_IN_STRICT"))
+                return;
+
             if (ctx?.Parser?.Reader == null || ctx.Parser.MethodKeys == null || ctx.Parser.Operands == null || ctx.PatternMatcher == null)
                 return;
 
@@ -1135,8 +1144,12 @@ namespace Krypton.Pipeline.Stages
                 var totalVotes = ordered.Sum(q => q.Value);
                 var confidence = totalVotes == 0 ? 0.0 : (double) best.Value / totalVotes;
 
-                if (best.Value < _heuristicsProfile.NeighborVoteMinimum ||
-                    confidence < _heuristicsProfile.NeighborConfidenceMinimum)
+                var minVotes = _heuristicsProfile.NeighborVoteMinimum + (strict ? 2 : 0);
+                var minConfidence = strict
+                    ? Math.Max(0.90, _heuristicsProfile.NeighborConfidenceMinimum)
+                    : _heuristicsProfile.NeighborConfidenceMinimum;
+
+                if (best.Value < minVotes || confidence < minConfidence)
                     continue;
                 if (!IsOperandTypeCompatible(best.Key, ctx.Parser.Operands[vmByte]))
                     continue;
@@ -1922,6 +1935,26 @@ namespace Krypton.Pipeline.Stages
             if (observation == null || observation.SampleCount <= 0)
                 return VMOpCode.Nop;
 
+            // RuntimeHelpers.InitializeArray only appears with ldtoken on
+            // <PrivateImplementationDetails> static RVA fields. A single occurrence
+            // is still definitive (the old logic required SampleCount >= 2 here).
+            if (observation.FieldTokenCount == observation.SampleCount &&
+                observation.PrivateImplDetailFieldCount == observation.SampleCount)
+            {
+                return VMOpCode.Ldtoken;
+            }
+
+            // Field operands are all <PrivateImplementationDetails> RVA fields, but the same
+            // VM byte can also carry type tokens elsewhere in the dispatcher — both are ldtoken.
+            if (observation.PrivateImplDetailFieldCount > 0 &&
+                observation.FieldTokenCount == observation.PrivateImplDetailFieldCount &&
+                observation.MethodTokenCount == 0 &&
+                observation.UserStringTokenCount == 0 &&
+                observation.FieldTokenCount + observation.TypeTokenCount == observation.SampleCount)
+            {
+                return VMOpCode.Ldtoken;
+            }
+
             // Low-sample, high-purity token observations are still valuable
             // for uncommon handlers (for example ctor-heavy Newobj bytes).
             if (observation.SampleCount >= 2)
@@ -1935,6 +1968,10 @@ namespace Krypton.Pipeline.Stages
 
                 if (observation.FieldTokenCount == observation.SampleCount)
                 {
+                    // <PrivateImplementationDetails> fields are exclusively used with
+                    // ldtoken + RuntimeHelpers.InitializeArray, never with ldsfld/ldfld.
+                    if (observation.PrivateImplDetailFieldCount == observation.SampleCount)
+                        return VMOpCode.Ldtoken;
                     return observation.InstanceFieldCount > observation.StaticFieldCount
                         ? VMOpCode.Ldfld
                         : VMOpCode.Ldsfld;
@@ -1967,6 +2004,8 @@ namespace Krypton.Pipeline.Stages
             if (observation.FieldTokenCount >= 3 &&
                 observation.FieldTokenCount * 10 >= observation.SampleCount * 8)
             {
+                if (observation.PrivateImplDetailFieldCount * 10 >= observation.FieldTokenCount * 8)
+                    return VMOpCode.Ldtoken;
                 if (observation.InstanceFieldCount > observation.StaticFieldCount)
                     return VMOpCode.Ldfld;
                 return VMOpCode.Ldsfld;
@@ -1996,6 +2035,7 @@ namespace Krypton.Pipeline.Stages
             public int FieldTokenCount { get; private set; }
             public int StaticFieldCount { get; private set; }
             public int InstanceFieldCount { get; private set; }
+            public int PrivateImplDetailFieldCount { get; private set; }
             public int UserStringTokenCount { get; private set; }
             public int TypeTokenCount { get; private set; }
 
@@ -2026,7 +2066,12 @@ namespace Krypton.Pipeline.Stages
                         FieldTokenCount++;
                         var resolved = field.Resolve();
                         if (resolved != null && resolved.IsStatic)
+                        {
                             StaticFieldCount++;
+                            var declType = resolved.DeclaringType?.Name?.Value ?? string.Empty;
+                            if (declType.Contains("PrivateImplementationDetails"))
+                                PrivateImplDetailFieldCount++;
+                        }
                         else
                             InstanceFieldCount++;
                     }

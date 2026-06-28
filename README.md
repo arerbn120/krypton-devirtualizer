@@ -17,6 +17,10 @@ Krypton processes a virtualized assembly and reconstructs virtualized methods ba
 4. `SemanticValidation` - runs a lightweight VM semantic validator (CFG + stack effects) and adjusts unsafe low-confidence mappings.
 5. `MethodRecompiling` - translates VM model back into compilable CIL.
 6. `MethodReplacing` - replaces virtualized method bodies with recompiled ones.
+7. `HiddenCallRecovery` - recovers NET Reactor "Hide Method Calls" stubs back into direct calls.
+8. `PostDeobfuscation` - renames obfuscated members, inlines trivial wrappers, simplifies control flow, and neutralizes leftover runtime.
+9. `StringDecryption` - inlines NET Reactor string-decoder call sites as literals (opt-in).
+10. `ResourceDecryption` - restores AES+deflate protected embedded resources (opt-in).
 
 ## What Was Improved In This Fork
 ### 1) Project modernization
@@ -53,6 +57,18 @@ Krypton processes a virtualized assembly and reconstructs virtualized methods ba
 - Safety behavior for unknown opcodes:
   - methods with unresolved opcodes are skipped for recompilation,
   - output is written only if at least one method was recompiled successfully.
+
+### 5) Hidden-call recovery and post-deobfuscation
+- `HiddenCallRecovery`: runs the `Krypton.Runner` helper (`net48`) against the original
+  assembly to capture the runtime `DynamicMethod` delegate table, builds a
+  `field-token -> real callee` map, and rewrites the `ldsfld <delegate>; Invoke` stub
+  pattern back into direct `call`/`callvirt` instructions.
+- `PostDeobfuscation`: dynamic, pattern-based cleanup (no hardcoding) - renames
+  obfuscated members, inlines trivial wrappers and resolved delegate calls, simplifies
+  opaque/constant control flow, repairs malformed expressions (e.g. AES
+  `TransformFinalBlock` length), and rebuilds WinForms constructor / `Dispose` / entry point.
+- `StringDecryption` / `ResourceDecryption`: opt-in recovery of NET Reactor string and
+  embedded-resource encryption (skips gracefully on RSA/NecroBit-tier blobs).
 
 ## Practical Goal
 This fork targets a devirtualized output that:
@@ -127,6 +143,12 @@ For `sample.exe`:
 - `KRYPTON_DISABLE_STARTUP_GUARD=1`
 - `KRYPTON_DISABLE_ALL_BOOTSTRAP_CCTORS=1`
 
+### Hidden-call recovery and cleanup
+- `KRYPTON_HCR_ENABLE=0` (disables `HiddenCallRecovery`; on by default)
+- `KRYPTON_CLEAN_ENABLE=0` (master kill-switch for `PostDeobfuscation`; on by default)
+- `KRYPTON_STRING_DECRYPT=1` (enables `StringDecryption`; off by default)
+- `KRYPTON_RESOURCE_DECRYPT=1` (enables `ResourceDecryption`; off by default)
+
 ### Write / patch behavior
 - `KRYPTON_ALLOW_PARTIAL_OUTPUT=1` (allows writing when some VM opcodes remain unresolved)
 - `KRYPTON_ALLOW_STABILIZATION_ONLY_OUTPUT=1` (allows output even with zero recompiled methods, applying only stabilization patches)
@@ -138,10 +160,10 @@ The repository includes helper utilities for pattern and runtime investigation:
 - `PatternProbe`
 - `HandlerDump`
 - `MethodFullDump`
-- `RuntimeProbe`
-- `FieldDump`
+- `MethodBodyPayloadProbe`
+- `ProtectionMap`
 
-These tools help during opcode mapping extension and regression analysis.
+These tools help during opcode mapping extension, payload-body inspection, and protection-regression analysis.
 
 ## Known Limitations
 - Not all Reactor families are fully covered; mapping still depends on observable handler patterns.

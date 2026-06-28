@@ -220,6 +220,242 @@ namespace Krypton.Pipeline.Stages
                 ctx.Options.Logger.Warning($"Pruned {removed} suspicious Pop mapping(s) after handler inspection.");
         }
 
+        private void RetuneLikelyIndexBytesMappedAsLdcI4(DevirtualizationCtx ctx)
+        {
+            if (ctx?.PatternMatcher == null || ctx.Parser?.Operands == null)
+                return;
+
+            var streams = CollectVmMethodStreams(ctx);
+            if (streams.Count == 0)
+                return;
+
+            var maxByte = Math.Min(_addressableOpcodeCount, ctx.Parser.Operands.Length);
+            var retuned = 0;
+            for (var vmByte = 0; vmByte < maxByte; vmByte++)
+            {
+                if (!ctx.PatternMatcher.IsOpCodeValueKnown(vmByte))
+                    continue;
+                if (ctx.PatternMatcher.GetOpCodeValue(vmByte) != VMOpCode.Ldc_I4)
+                    continue;
+                if (ctx.Parser.Operands[vmByte] != 1)
+                    continue;
+
+                var localLike = IsLikelyLocalIndexByte(streams, vmByte);
+                var argLike = IsLikelyArgumentIndexByte(streams, vmByte);
+                if (!localLike && !argLike)
+                    continue;
+
+                var candidates = new List<VMOpCode>();
+                if (localLike)
+                {
+                    candidates.Add(VMOpCode.Ldloc);
+                    candidates.Add(VMOpCode.Stloc);
+                }
+
+                if (argLike)
+                    candidates.Add(VMOpCode.Ldarg);
+
+                var baselineGlobal = ScoreStackPenalty(ctx, streams, vmByte, VMOpCode.Ldc_I4);
+                var (baselineWindow, _) = ScoreWindowPenalty(ctx, streams, vmByte, VMOpCode.Ldc_I4, windowRadius: 8);
+
+                var best = (opCode: VMOpCode.Nop, global: int.MaxValue, window: int.MaxValue);
+                foreach (var candidate in candidates.Distinct())
+                {
+                    if (!IsOperandTypeCompatible(candidate, 1))
+                        continue;
+                    if (!IsCandidateValidAcrossOccurrences(ctx, streams, vmByte, candidate))
+                        continue;
+
+                    var global = ScoreStackPenalty(ctx, streams, vmByte, candidate);
+                    var (window, covered) = ScoreWindowPenalty(ctx, streams, vmByte, candidate, windowRadius: 8);
+                    if (covered == 0)
+                        continue;
+
+                    if (global < best.global || (global == best.global && window < best.window))
+                        best = (candidate, global, window);
+                }
+
+                if (best.opCode == VMOpCode.Nop)
+                    continue;
+
+                var globalGain = baselineGlobal - best.global;
+                var windowGain = baselineWindow - best.window;
+                if (globalGain < 12 && windowGain < 12)
+                    continue;
+
+                ApplyMapping(
+                    ctx,
+                    vmByte,
+                    best.opCode,
+                    0.86,
+                    "index-like-ldc-retune");
+                retuned++;
+
+                ctx.Options.Logger.Warning(
+                    $"Index-like retune remapped vm 0x{vmByte:X2} Ldc_I4 -> {best.opCode} " +
+                    $"(global {baselineGlobal}->{best.global}, window {baselineWindow}->{best.window}).");
+            }
+
+            if (retuned > 0)
+                ctx.Options.Logger.Warning($"Index-like retune adjusted {retuned} Ldc_I4 mapping(s).");
+        }
+
+        private void RetuneFinallyGuardPatternMappings(DevirtualizationCtx ctx)
+        {
+            if (ctx?.PatternMatcher == null || ctx.Parser?.Reader == null || ctx.Parser.MethodKeys == null || ctx.Parser.Operands == null)
+                return;
+
+            var parser = ctx.Parser;
+            var stream = parser.Reader.BaseStream;
+            var originalPosition = stream.Position;
+
+            var ldlocVotes = new Dictionary<int, int>();
+            var brFalseVotes = new Dictionary<int, int>();
+            var endFinallyVotes = new Dictionary<int, int>();
+
+            try
+            {
+                foreach (var methodKey in parser.MethodKeys)
+                {
+                    stream.Position = methodKey;
+                    parser.ReadEncryptedByte(); // parent token
+                    var locals = parser.ReadEncryptedByte();
+                    var exceptionHandlers = parser.ReadEncryptedByte();
+                    var instructionCount = parser.ReadEncryptedByte();
+
+                    for (var i = 0; i < locals; i++)
+                        parser.ReadEncryptedByte();
+
+                    var handlers = new List<VMExceptionHandler>(exceptionHandlers);
+                    for (var i = 0; i < exceptionHandlers; i++)
+                        handlers.Add(new VMExceptionHandler().Read(ctx.Module, parser));
+
+                    var entries = new List<(int VmByte, object Operand)>(instructionCount);
+                    for (var i = 0; i < instructionCount; i++)
+                    {
+                        var vmByte = parser.Reader.ReadByte();
+                        object operand = null;
+                        if (vmByte >= 0 && vmByte < parser.Operands.Length)
+                            operand = ReadOperandSample(parser, parser.Operands[vmByte]);
+                        entries.Add((vmByte, operand));
+                    }
+
+                    foreach (var eh in handlers)
+                    {
+                        if (eh == null || (eh.EHType != VMExceptionHandlerType.Finally && eh.EHType != VMExceptionHandlerType.Fault))
+                            continue;
+
+                        var hs = eh.HandlerStart;
+                        var he = eh.HandlerEnd;
+                        if (hs < 0 || he <= hs || he > entries.Count)
+                            continue;
+
+                        var endVmByte = entries[he - 1].VmByte;
+                        if (endVmByte >= 0 &&
+                            endVmByte < parser.Operands.Length &&
+                            parser.Operands[endVmByte] == 0)
+                        {
+                            if (!endFinallyVotes.TryGetValue(endVmByte, out var endCount))
+                                endCount = 0;
+                            endFinallyVotes[endVmByte] = endCount + 1;
+                        }
+
+                        for (var j = hs + 1; j + 2 < he; j++)
+                        {
+                            var prev = entries[j - 1];
+                            var branch = entries[j];
+                            var next = entries[j + 1];
+                            var call = entries[j + 2];
+
+                            if (prev.VmByte != next.VmByte)
+                                continue;
+                            if (!(prev.Operand is int localA) || !(next.Operand is int localB) || localA != localB)
+                                continue;
+                            if (localA < 0 || localA >= locals)
+                                continue;
+                            if (!(branch.Operand is int target) || target != he - 1)
+                                continue;
+                            if (!IsDisposeMethodToken(ctx.Module, call.Operand))
+                                continue;
+
+                            if (!ldlocVotes.TryGetValue(prev.VmByte, out var ldCount))
+                                ldCount = 0;
+                            ldlocVotes[prev.VmByte] = ldCount + 1;
+
+                            if (!brFalseVotes.TryGetValue(branch.VmByte, out var brCount))
+                                brCount = 0;
+                            brFalseVotes[branch.VmByte] = brCount + 1;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                HandleBestEffortFailure(ctx, "finally-guard retune", ex);
+                return;
+            }
+            finally
+            {
+                stream.Position = originalPosition;
+            }
+
+            ApplyDominantVoteMapping(ctx, ldlocVotes, VMOpCode.Ldloc, "finally-guard-pattern", minimumVotes: 2);
+            ApplyDominantVoteMapping(ctx, brFalseVotes, VMOpCode.BrFalse, "finally-guard-pattern", minimumVotes: 2);
+            ApplyDominantVoteMapping(ctx, endFinallyVotes, VMOpCode.EndFinally, "finally-guard-pattern", minimumVotes: 2);
+        }
+
+        private void ApplyDominantVoteMapping(
+            DevirtualizationCtx ctx,
+            IReadOnlyDictionary<int, int> votes,
+            VMOpCode target,
+            string source,
+            int minimumVotes)
+        {
+            if (ctx?.Parser?.Operands == null || votes == null || votes.Count == 0)
+                return;
+
+            var best = votes.OrderByDescending(v => v.Value).First();
+            var total = votes.Values.Sum();
+            if (best.Value < minimumVotes)
+                return;
+            if (total > 0 && best.Value * 2 < total)
+                return;
+
+            var vmByte = best.Key;
+            if (vmByte < 0 || vmByte >= ctx.Parser.Operands.Length)
+                return;
+            if (!IsOperandTypeCompatible(target, ctx.Parser.Operands[vmByte]))
+                return;
+
+            ApplyMapping(ctx, vmByte, target, 0.90, source);
+            ctx.Options.Logger.Warning(
+                $"Finally-guard retune mapped vm 0x{vmByte:X2} -> {target} (votes {best.Value}/{total}).");
+        }
+
+        private bool IsDisposeMethodToken(ModuleDefinition module, object operand)
+        {
+            if (!(operand is int token))
+                return false;
+
+            try
+            {
+                if (!(module.LookupMember(token) is IMethodDescriptor descriptor))
+                    return false;
+                var signature = descriptor.Signature ?? descriptor.Resolve()?.Signature;
+                if (signature == null)
+                    return false;
+                if (!string.Equals(descriptor.Name ?? descriptor.Resolve()?.Name, "Dispose", StringComparison.Ordinal))
+                    return false;
+                if (signature.ParameterTypes.Count != 0)
+                    return false;
+                return string.Equals(signature.ReturnType?.FullName, "System.Void", StringComparison.Ordinal);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private void PruneOperandIncompatibleMappings(DevirtualizationCtx ctx)
         {
             if (ctx?.PatternMatcher == null || ctx.Parser?.Operands == null)
@@ -375,12 +611,18 @@ namespace Krypton.Pipeline.Stages
         {
             if (operandType != 1)
                 return false;
-            if (mapped != VMOpCode.Add &&
-                mapped != VMOpCode.Sub &&
-                mapped != VMOpCode.Xor &&
-                mapped != VMOpCode.Shl &&
-                mapped != VMOpCode.Shr &&
-                mapped != VMOpCode.Conv_I4 &&
+            // Never defer incompatible arithmetic/shift mappings on operand-1 bytes.
+            // These tend to be branch/local opcodes in dense Reactor dispatchers.
+            if (mapped == VMOpCode.Add ||
+                mapped == VMOpCode.Sub ||
+                mapped == VMOpCode.Xor ||
+                mapped == VMOpCode.Shl ||
+                mapped == VMOpCode.Shr)
+            {
+                return false;
+            }
+
+            if (mapped != VMOpCode.Conv_I4 &&
                 mapped != VMOpCode.Conv_I8 &&
                 mapped != VMOpCode.Conv_U1)
             {

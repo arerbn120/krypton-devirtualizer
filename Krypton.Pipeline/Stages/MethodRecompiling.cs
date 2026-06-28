@@ -18,12 +18,14 @@ namespace Krypton.Pipeline.Stages
     public class MethodRecompiling : IStage, ICilLowerer
     {
         private readonly Dictionary<int, string> _userStringCache = new Dictionary<int, string>();
+        private readonly HashSet<string> _loggedCallFallbacks = new HashSet<string>();
         private string _userStringCachePath;
 
         public string Name => nameof(MethodRecompiling);
 
         public void Run(DevirtualizationCtx Ctx)
         {
+            _loggedCallFallbacks.Clear();
             if (!string.Equals(_userStringCachePath, Ctx.Options.FilePath, StringComparison.OrdinalIgnoreCase))
             {
                 _userStringCache.Clear();
@@ -481,6 +483,14 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.Call:
                 case VMOpCode.Callvirt:
                 {
+                    if (producer.Operand is int producerToken &&
+                        !IsMethodMetadataToken(producerToken))
+                    {
+                        // Wrong call-mapping occasionally leaks raw metadata tokens.
+                        // Treat these as integer constants so local type inference stays resilient.
+                        return ctx.Module.CorLibTypeFactory.Int32;
+                    }
+
                     var descriptor = ResolveMethodDescriptor(ctx, producer.Operand);
                     return ResolveCallReturnType(descriptor);
                 }
@@ -595,9 +605,15 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.Ldstr:
                     return new CilInstruction(CilOpCodes.Ldstr, ResolveUserString(ctx, Convert.ToInt32(instruction.Operand)));
                 case VMOpCode.Call:
-                    return BuildCallInstruction(ctx, instruction.Operand, false);
+                    if (TryBuildCallInstructionOrFallback(ctx, vmMethod, instruction, false, out var callInstruction))
+                        return callInstruction;
+
+                    throw new DevirtualizationException("Could not translate VM Call instruction.");
                 case VMOpCode.Callvirt:
-                    return BuildCallInstruction(ctx, instruction.Operand, true);
+                    if (TryBuildCallInstructionOrFallback(ctx, vmMethod, instruction, true, out var virtualCallInstruction))
+                        return virtualCallInstruction;
+
+                    throw new DevirtualizationException("Could not translate VM Callvirt instruction.");
                 case VMOpCode.Newobj:
                     return new CilInstruction(CilOpCodes.Newobj, ResolveMethodDescriptor(ctx, instruction.Operand));
                 case VMOpCode.Newarr:
@@ -658,6 +674,8 @@ namespace Krypton.Pipeline.Stages
                     return new CilInstruction(CilOpCodes.Neg);
                 case VMOpCode.Ldnull:
                     return new CilInstruction(CilOpCodes.Ldnull);
+                case VMOpCode.Ldtoken:
+                    return BuildLdtokenInstruction(ctx, instruction.Operand);
                 case VMOpCode.Switch:
                 {
                     if (!(instruction.Operand is int[] targets))
@@ -2909,16 +2927,201 @@ namespace Krypton.Pipeline.Stages
             return new CilInstruction(opcode, descriptor);
         }
 
+        private bool TryBuildCallInstructionOrFallback(
+            DevirtualizationCtx ctx,
+            VMMethod vmMethod,
+            VMInstruction instruction,
+            bool forceVirtualCall,
+            out CilInstruction translated)
+        {
+            translated = null;
+            try
+            {
+                translated = BuildCallInstruction(ctx, instruction.Operand, forceVirtualCall);
+                return true;
+            }
+            catch (DevirtualizationException ex) when (TryLowerInvalidCallOperandAsConstant(ctx, vmMethod, instruction, ex, out var fallback))
+            {
+                translated = fallback;
+                return true;
+            }
+        }
+
+        private bool TryLowerInvalidCallOperandAsConstant(
+            DevirtualizationCtx ctx,
+            VMMethod vmMethod,
+            VMInstruction instruction,
+            Exception cause,
+            out CilInstruction fallback)
+        {
+            fallback = null;
+            if (!(instruction?.Operand is int token))
+                return false;
+
+            if (IsMethodMetadataToken(token) && !IsUnresolvableMetadataTokenException(cause))
+                return false;
+
+            fallback = new CilInstruction(CilOpCodes.Ldc_I4, token);
+            var parentName = vmMethod?.Parent?.FullName ?? "<unknown>";
+            var fallbackKey = $"{parentName}|{instruction.Offset}|{instruction.VmByte:X2}|{token:X8}|{instruction.OpCode}";
+            if (_loggedCallFallbacks.Add(fallbackKey))
+            {
+                ctx.Options.Logger.Warning(
+                    $"Call-mapping fallback: lowered vm 0x{instruction.VmByte:X2} ({instruction.OpCode}) " +
+                    $"at {parentName} offset {instruction.Offset} from invalid token 0x{token:X8} ({GetMetadataTokenKind(token)}). " +
+                    $"Original error: {cause.Message}");
+            }
+            return true;
+        }
+
+        private bool IsUnresolvableMetadataTokenException(Exception exception)
+        {
+            var message = exception?.Message;
+            if (string.IsNullOrWhiteSpace(message))
+                return false;
+
+            return message.IndexOf("Cannot resolve metadata token", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private bool IsMethodMetadataToken(int token)
+        {
+            var table = (token >> 24) & 0xFF;
+            return table == 0x06 || // MethodDef
+                   table == 0x0A || // MemberRef
+                   table == 0x2B;   // MethodSpec
+        }
+
+        private string GetMetadataTokenKind(int token)
+        {
+            var table = (token >> 24) & 0xFF;
+            switch (table)
+            {
+                case 0x00:
+                    return "Nil";
+                case 0x01:
+                    return "TypeRef";
+                case 0x02:
+                    return "TypeDef";
+                case 0x04:
+                    return "Field";
+                case 0x06:
+                    return "MethodDef";
+                case 0x08:
+                    return "Param";
+                case 0x09:
+                    return "InterfaceImpl";
+                case 0x0A:
+                    return "MemberRef";
+                case 0x0B:
+                    return "Constant";
+                case 0x0C:
+                    return "CustomAttribute";
+                case 0x0D:
+                    return "FieldMarshal";
+                case 0x0E:
+                    return "DeclSecurity";
+                case 0x0F:
+                    return "ClassLayout";
+                case 0x10:
+                    return "FieldLayout";
+                case 0x11:
+                    return "StandAloneSig";
+                case 0x12:
+                    return "EventMap";
+                case 0x14:
+                    return "Event";
+                case 0x15:
+                    return "PropertyMap";
+                case 0x17:
+                    return "Property";
+                case 0x18:
+                    return "MethodSemantics";
+                case 0x19:
+                    return "MethodImpl";
+                case 0x1A:
+                    return "ModuleRef";
+                case 0x1B:
+                    return "TypeSpec";
+                case 0x1C:
+                    return "ImplMap";
+                case 0x1D:
+                    return "FieldRva";
+                case 0x20:
+                    return "Assembly";
+                case 0x23:
+                    return "AssemblyRef";
+                case 0x26:
+                    return "File";
+                case 0x27:
+                    return "ExportedType";
+                case 0x28:
+                    return "ManifestResource";
+                case 0x2A:
+                    return "GenericParam";
+                case 0x2B:
+                    return "MethodSpec";
+                case 0x2C:
+                    return "GenericParamConstraint";
+                case 0x70:
+                    return "UserString";
+                default:
+                    return $"Table0x{table:X2}";
+            }
+        }
+
         private IMethodDescriptor ResolveMethodDescriptor(DevirtualizationCtx ctx, object operand)
         {
             if (!(operand is int token))
                 throw new DevirtualizationException("Expected method token operand.");
 
-            var member = ctx.Module.LookupMember(token);
-            if (member is IMethodDescriptor descriptor)
+            if (TryResolveMethodDescriptor(ctx, token, out var descriptor))
                 return descriptor;
 
             throw new DevirtualizationException($"Token 0x{token:X8} is not a method descriptor.");
+        }
+
+        private bool TryResolveMethodDescriptor(
+            DevirtualizationCtx ctx,
+            int token,
+            out IMethodDescriptor descriptor)
+        {
+            descriptor = null;
+
+            var member = TryLookupMember(ctx, token);
+            if (member is IMethodDescriptor directDescriptor)
+            {
+                descriptor = directDescriptor;
+                return true;
+            }
+
+            var table = (token >> 24) & 0xFF;
+            var rid = token & 0x00FFFFFF;
+            if ((table == 0x0A || table == 0x2B) && rid > 0)
+            {
+                // Some protected samples leak method-like tokens encoded as member-ref rids
+                // even though the target entry lives in MethodDef.
+                var methodDefToken = unchecked((int) 0x06000000) | rid;
+                var fallbackMember = TryLookupMember(ctx, methodDefToken);
+                if (fallbackMember is IMethodDescriptor fallbackDescriptor)
+                {
+                    descriptor = fallbackDescriptor;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private IMetadataMember TryLookupMember(DevirtualizationCtx ctx, int token)
+        {
+            try
+            {
+                return ctx.Module.LookupMember(token);
+            }
+            catch (Exception)
+            {
+                return null;
+            }
         }
 
         private IFieldDescriptor ResolveFieldDescriptor(DevirtualizationCtx ctx, object operand)
@@ -2945,6 +3148,22 @@ namespace Krypton.Pipeline.Stages
                 return typeDefOrRefSignature.Type;
 
             throw new DevirtualizationException($"Token 0x{token:X8} is not a type reference.");
+        }
+
+        private CilInstruction BuildLdtokenInstruction(DevirtualizationCtx ctx, object operand)
+        {
+            if (!(operand is int token))
+                throw new DevirtualizationException("Expected metadata token operand for ldtoken.");
+
+            var member = TryLookupMember(ctx, token);
+            if (member is ITypeDefOrRef type)
+                return new CilInstruction(CilOpCodes.Ldtoken, type);
+            if (member is IFieldDescriptor field)
+                return new CilInstruction(CilOpCodes.Ldtoken, field);
+            if (member is IMethodDescriptor method)
+                return new CilInstruction(CilOpCodes.Ldtoken, method);
+
+            throw new DevirtualizationException($"Token 0x{token:X8} cannot be resolved as type/field/method for ldtoken.");
         }
 
         private CilInstruction BuildLdobjInstruction(DevirtualizationCtx ctx, object operand)

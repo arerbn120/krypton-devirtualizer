@@ -172,6 +172,9 @@ namespace Krypton.Pipeline.Stages
 
         private void InferRareUnknownByWindowedStackConsistency(DevirtualizationCtx ctx)
         {
+            if (IsStrictMappingMode() && !IsEnvironmentEnabled("KRYPTON_ENABLE_WINDOWED_STACK_IN_STRICT"))
+                return;
+
             if (ctx?.Parser?.Reader == null || ctx.Parser.MethodKeys == null || ctx.Parser.Operands == null || ctx.PatternMatcher == null)
                 return;
 
@@ -569,6 +572,9 @@ namespace Krypton.Pipeline.Stages
 
         private void InferLastResortRareUnknowns(DevirtualizationCtx ctx)
         {
+            if (IsStrictMappingMode() && !IsEnvironmentEnabled("KRYPTON_ENABLE_LAST_RESORT_IN_STRICT"))
+                return;
+
             if (ctx?.Parser?.Reader == null || ctx.Parser.MethodKeys == null || ctx.Parser.Operands == null || ctx.PatternMatcher == null)
                 return;
 
@@ -833,6 +839,30 @@ namespace Krypton.Pipeline.Stages
             return seen > 0 && localLike * 2 >= seen;
         }
 
+        private bool IsLikelyArgumentIndexByte(IReadOnlyList<VmMethodStreamSample> streams, int vmByte)
+        {
+            var seen = 0;
+            var argLike = 0;
+
+            foreach (var stream in streams)
+            {
+                for (var i = 0; i < stream.Instructions.Count; i++)
+                {
+                    var sample = stream.Instructions[i];
+                    if (sample.VmByte != vmByte)
+                        continue;
+                    if (!(sample.Operand is int index))
+                        return false;
+
+                    seen++;
+                    if (index >= 0 && index < stream.ArgCount)
+                        argLike++;
+                }
+            }
+
+            return seen > 0 && argLike * 2 >= seen;
+        }
+
         private bool IsLikelyBinaryOperationContext(
             PatternMatcher matcher,
             IReadOnlyList<VmMethodStreamSample> streams,
@@ -1012,6 +1042,7 @@ namespace Krypton.Pipeline.Stages
                         VMOpCode.Nop,
                         VMOpCode.Pop,
                         VMOpCode.Dup,
+                        VMOpCode.EndFinally,
                         VMOpCode.Conv_I4,
                         VMOpCode.Conv_I8,
                         VMOpCode.Conv_U1,
@@ -1031,6 +1062,7 @@ namespace Krypton.Pipeline.Stages
                         VMOpCode.Ldarg,
                         VMOpCode.Ldc_I4,
                         VMOpCode.Stloc,
+                        VMOpCode.Leave,
                         VMOpCode.Br,
                         VMOpCode.BrTrue,
                         VMOpCode.BrFalse,
@@ -1073,6 +1105,7 @@ namespace Krypton.Pipeline.Stages
                         VMOpCode.Nop,
                         VMOpCode.Pop,
                         VMOpCode.Dup,
+                        VMOpCode.EndFinally,
                         VMOpCode.Conv_I4,
                         VMOpCode.Conv_I8,
                         VMOpCode.Conv_U1,
@@ -1092,6 +1125,7 @@ namespace Krypton.Pipeline.Stages
                         VMOpCode.Ldarg,
                         VMOpCode.Ldc_I4,
                         VMOpCode.Stloc,
+                        VMOpCode.Leave,
                         VMOpCode.Br,
                         VMOpCode.BrTrue,
                         VMOpCode.BrFalse,
@@ -1138,7 +1172,14 @@ namespace Krypton.Pipeline.Stages
             // Strong branch-shape bytes (target-like operands, never local/arg-like)
             // are better resolved against branch candidates only.
             if (operandType == 1 && IsStrongBranchTargetByte(streams, vmByte))
-                return new List<VMOpCode> { VMOpCode.Br, VMOpCode.BrTrue, VMOpCode.BrFalse, VMOpCode.BrLessThan };
+                return new List<VMOpCode>
+                {
+                    VMOpCode.Br,
+                    VMOpCode.BrTrue,
+                    VMOpCode.BrFalse,
+                    VMOpCode.BrLessThan,
+                    VMOpCode.Leave
+                };
 
             return candidates;
         }
@@ -1312,6 +1353,8 @@ namespace Krypton.Pipeline.Stages
                     push = 1;
                     return true;
                 case VMOpCode.Br:
+                case VMOpCode.Leave:
+                case VMOpCode.EndFinally:
                     return true;
                 case VMOpCode.BrTrue:
                 case VMOpCode.BrFalse:

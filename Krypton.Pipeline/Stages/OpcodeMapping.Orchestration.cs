@@ -42,6 +42,11 @@ namespace Krypton.Pipeline.Stages
         public void MapOpcodes(DevirtualizationCtx Ctx)
         {
             Ctx.OpcodeConfidence = new Dictionary<int, OpcodeMappingConfidence>();
+            if (IsStrictMappingMode())
+            {
+                Ctx.Options.Logger.Info(
+                    "Strict mapping mode enabled (KRYPTON_STRICT_MAPPING=1): limiting aggressive inference passes.");
+            }
             var observedVmByteHistogram = GetObservedVmByteHistogram(Ctx);
             _dispatcherProfile = new DispatcherStrategyProfile();
             _heuristicsProfile = new OpcodeMappingHeuristicsProfile();
@@ -136,6 +141,7 @@ namespace Krypton.Pipeline.Stages
             SelectionResult internalSelection,
             IList<ICilLabel> switchLabels)
         {
+            var strict = IsStrictMappingMode();
             InferStructurallyUniqueOperandOpcodes(ctx);
             InferUnmappedOpcodesFromOperandSemantics(ctx);
             InferUnknownByIntrinsicTypeTokenHandlers(ctx);
@@ -144,25 +150,31 @@ namespace Krypton.Pipeline.Stages
             InferUnknownByPointerProjectionUnaryHandlers(ctx);
             InferUnknownByStelemI1Handlers(ctx);
             InferUnmappedOpcodesByHandlerSimilarity(ctx, internalSelection, switchLabels);
-            InferUnknownByNeighborContext(ctx);
+            if (!strict || IsEnvironmentEnabled("KRYPTON_ENABLE_NEIGHBOR_CONTEXT_IN_STRICT"))
+                InferUnknownByNeighborContext(ctx);
             InferUnknownDupBeforeStructuredStelemRef(ctx);
         }
 
         private void ExecuteScoringPhase(DevirtualizationCtx ctx)
         {
+            var strict = IsStrictMappingMode();
             InferDominantUnknownIndexLikeOpcodes(ctx);
             InferUnknownByStackConsistency(ctx);
-            InferRareUnknownByWindowedStackConsistency(ctx);
+            if (!strict || IsEnvironmentEnabled("KRYPTON_ENABLE_WINDOWED_STACK_IN_STRICT"))
+                InferRareUnknownByWindowedStackConsistency(ctx);
             InferRareUnknownByConsensus(ctx);
             InferRareOperand1BranchesByTargetAndNeighbors(ctx);
             InferReactorVersionAwareDispatcherBranches(ctx);
             InferSmallUnknownSetByJointStackSearch(ctx);
-            InferLastResortRareUnknowns(ctx);
+            if (!strict || IsEnvironmentEnabled("KRYPTON_ENABLE_LAST_RESORT_IN_STRICT"))
+                InferLastResortRareUnknowns(ctx);
         }
 
         private void ExecutePruningPhase(DevirtualizationCtx ctx)
         {
             ApplyControlFlowConstraints(ctx);
+            RetuneLikelyIndexBytesMappedAsLdcI4(ctx);
+            RetuneFinallyGuardPatternMappings(ctx);
             PruneOperandIncompatibleMappings(ctx);
             PruneSemanticallyInvalidIndexLikeMappings(ctx);
             PruneLowConfidencePopMappings(ctx);
@@ -171,23 +183,29 @@ namespace Krypton.Pipeline.Stages
 
         private void ExecuteSemanticRepairPhase(DevirtualizationCtx ctx)
         {
+            var strict = IsStrictMappingMode();
             // Handler-pattern mappings are optimistic by design; after pruning,
             // run selected inference passes once more to recover compatible mappings.
             InferUnmappedOpcodesFromOperandSemantics(ctx);
             InferUnknownByStackConsistency(ctx);
             InferRareOperand1BranchesByTargetAndNeighbors(ctx);
             InferReactorVersionAwareDispatcherBranches(ctx);
-            InferLastResortRareUnknowns(ctx);
+            if (!strict || IsEnvironmentEnabled("KRYPTON_ENABLE_LAST_RESORT_IN_STRICT"))
+                InferLastResortRareUnknowns(ctx);
             RetuneRareHighRiskArithmeticMappings(ctx);
             RetuneSuspiciousUnaryMappingsByBinaryContext(ctx);
         }
 
         private void ExecuteFinalizationPhase(DevirtualizationCtx ctx)
         {
+            var strict = IsStrictMappingMode();
             InferTailTerminatorRetMappings(ctx);
             ApplyEnvironmentOpcodeOverrides(ctx);
+            if (strict && IsEnvironmentEnabled("KRYPTON_ENABLE_STRICT_BRANCH_RESOLVER", true))
+                ResolveRemainingUnknownBranchesStrict(ctx);
             InferSingletonOperand0TieAsNoOp(ctx);
-            ResolveRemainingUnknownOpcodesAggressively(ctx);
+            if (!strict || IsEnvironmentEnabled("KRYPTON_ENABLE_AGGRESSIVE_RESOLVER_IN_STRICT"))
+                ResolveRemainingUnknownOpcodesAggressively(ctx);
             PruneOperandIncompatibleMappings(ctx);
             PruneSemanticallyInvalidIndexLikeMappings(ctx);
             LogRemainingUnknownCandidates(ctx);
@@ -296,6 +314,34 @@ namespace Krypton.Pipeline.Stages
         private bool IsStrictDiagnostics(DevirtualizationCtx ctx)
         {
             return ctx?.Options?.StrictDiagnostics == true;
+        }
+
+        private bool IsStrictMappingMode()
+        {
+            return IsEnvironmentEnabled("KRYPTON_STRICT_MAPPING");
+        }
+
+        private bool IsEnvironmentEnabled(string variableName, bool defaultValue = false)
+        {
+            var value = Environment.GetEnvironmentVariable(variableName);
+            if (string.IsNullOrWhiteSpace(value))
+                return defaultValue;
+
+            switch (value.Trim().ToLowerInvariant())
+            {
+                case "1":
+                case "true":
+                case "yes":
+                case "on":
+                    return true;
+                case "0":
+                case "false":
+                case "no":
+                case "off":
+                    return false;
+                default:
+                    return defaultValue;
+            }
         }
 
         private void HandleBestEffortFailure(DevirtualizationCtx ctx, string phase, Exception ex)

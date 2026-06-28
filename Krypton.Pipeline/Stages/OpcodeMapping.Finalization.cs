@@ -197,8 +197,110 @@ namespace Krypton.Pipeline.Stages
                 ctx.Options.Logger.Info($"Tail-terminator inference mapped {inferred} VM opcode(s) to Ret.");
         }
 
+        private void ResolveRemainingUnknownBranchesStrict(DevirtualizationCtx ctx)
+        {
+            if (!IsStrictMappingMode())
+                return;
+            if (ctx?.Parser?.Reader == null || ctx.Parser.MethodKeys == null || ctx.Parser.Operands == null || ctx.PatternMatcher == null)
+                return;
+
+            var streams = CollectVmMethodStreams(ctx);
+            if (streams.Count == 0)
+                return;
+
+            var unknownFrequency = new Dictionary<int, int>();
+            foreach (var stream in streams)
+            {
+                foreach (var sample in stream.Instructions)
+                {
+                    if (ctx.PatternMatcher.IsOpCodeValueKnown(sample.VmByte))
+                        continue;
+                    if (!unknownFrequency.TryGetValue(sample.VmByte, out var count))
+                        count = 0;
+                    unknownFrequency[sample.VmByte] = count + 1;
+                }
+            }
+
+            var inferred = 0;
+            foreach (var pair in unknownFrequency.OrderByDescending(p => p.Value))
+            {
+                var vmByte = pair.Key;
+                var frequency = pair.Value;
+                if (ctx.PatternMatcher.IsOpCodeValueKnown(vmByte))
+                    continue;
+                if (vmByte < 0 || vmByte >= ctx.Parser.Operands.Length)
+                    continue;
+                if (ctx.Parser.Operands[vmByte] != 1)
+                    continue;
+
+                var candidates = BuildCandidatesForUnknownByte(streams, vmByte, operandType: 1)
+                    .Distinct()
+                    .Where(c => IsOperandTypeCompatible(c, 1))
+                    .Where(c => IsBranchOpcode(c) || c == VMOpCode.Leave)
+                    .ToList();
+                if (candidates.Count == 0)
+                    continue;
+
+                var scored = new List<(VMOpCode opCode, int globalPenalty, int windowPenalty, int covered)>();
+                foreach (var candidate in candidates)
+                {
+                    if (!IsCandidateValidAcrossOccurrences(ctx, streams, vmByte, candidate))
+                        continue;
+                    var globalPenalty = ScoreStackPenalty(ctx, streams, vmByte, candidate);
+                    var (windowPenalty, covered) = ScoreWindowPenalty(ctx, streams, vmByte, candidate, windowRadius: 8);
+                    scored.Add((candidate, globalPenalty, windowPenalty, covered));
+                }
+
+                if (scored.Count == 0)
+                    continue;
+
+                scored = scored
+                    .OrderBy(s => s.globalPenalty)
+                    .ThenBy(s => s.windowPenalty)
+                    .ThenByDescending(s => s.covered)
+                    .ThenBy(s => (int) s.opCode)
+                    .ToList();
+
+                var best = scored[0];
+                var second = scored.Count > 1 ? scored[1] : (best.opCode, best.globalPenalty, best.windowPenalty, best.covered);
+                var globalMargin = second.globalPenalty - best.globalPenalty;
+                var windowMargin = second.windowPenalty - best.windowPenalty;
+                var strongTarget = IsStrongBranchTargetByte(streams, vmByte);
+
+                var accept =
+                    scored.Count == 1 ||
+                    (strongTarget && globalMargin >= 1 && windowMargin >= 1) ||
+                    (frequency <= 2 && globalMargin >= 1) ||
+                    (frequency >= 3 && globalMargin >= 2 && windowMargin >= 1);
+                if (!accept)
+                    continue;
+
+                var confidence = 0.74
+                                 + Math.Min(0.08, Math.Max(0, globalMargin) / 150.0)
+                                 + Math.Min(0.05, Math.Max(0, windowMargin) / 120.0)
+                                 + (strongTarget ? 0.04 : 0.0);
+                ApplyMapping(ctx, vmByte, best.opCode, Math.Min(0.93, confidence), "strict-branch-resolver");
+                inferred++;
+
+                if (string.Equals(Environment.GetEnvironmentVariable("KRYPTON_LOG_VM_MAP"), "1", StringComparison.Ordinal))
+                {
+                    ctx.Options.Logger.Info(
+                        $"vm 0x{vmByte:X2} -> {best.opCode} (strict-branch-resolver; freq={frequency}, strong={(strongTarget ? 1 : 0)}, g/w margin={globalMargin}/{windowMargin})");
+                }
+            }
+
+            if (inferred > 0)
+            {
+                ctx.Options.Logger.Info(
+                    $"Strict branch resolver mapped {inferred} VM opcode(s) while strict mode is enabled.");
+            }
+        }
+
         private void ResolveRemainingUnknownOpcodesAggressively(DevirtualizationCtx ctx)
         {
+            if (IsStrictMappingMode() && !IsEnvironmentEnabled("KRYPTON_ENABLE_AGGRESSIVE_RESOLVER_IN_STRICT"))
+                return;
+
             if (ctx?.Parser?.Reader == null || ctx.Parser.MethodKeys == null || ctx.Parser.Operands == null || ctx.PatternMatcher == null)
                 return;
 
@@ -356,7 +458,18 @@ namespace Krypton.Pipeline.Stages
                 score += 5;
             }
 
-            if (candidate == VMOpCode.Ldarg && !IsLikelyLocalIndexByte(streams, vmByte))
+            if (candidate == VMOpCode.Ldarg && IsLikelyArgumentIndexByte(streams, vmByte))
+                score += 5;
+
+            if (candidate == VMOpCode.Ldc_I4 && IsLikelyLocalIndexByte(streams, vmByte))
+                score -= 4;
+
+            if (candidate == VMOpCode.Ldc_I4 && IsLikelyArgumentIndexByte(streams, vmByte))
+                score -= 4;
+
+            if (candidate == VMOpCode.Ldarg &&
+                !IsLikelyLocalIndexByte(streams, vmByte) &&
+                !IsLikelyArgumentIndexByte(streams, vmByte))
                 score += 2;
 
             if (IsBinaryStackOpcode(candidate) &&

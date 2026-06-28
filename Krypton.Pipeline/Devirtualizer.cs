@@ -3,13 +3,18 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.Json;
 using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
+using AsmResolver.IO;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Builder;
+using AsmResolver.DotNet.Signatures;
+using AsmResolver.DotNet.Signatures.Types;
 using AsmResolver.PE.DotNet.Cil;
+using AsmResolver.PE.DotNet.Metadata.Tables.Rows;
 using Krypton.Core;
 using Krypton.Core.Disassembly;
 using Krypton.Core.Payload;
@@ -86,7 +91,11 @@ namespace Krypton.Pipeline
                 new MethodDisassembling(),
                 semanticValidationStage,
                 methodRecompiling,
-                new MethodReplacing()
+                new MethodReplacing(),
+                new HiddenCallRecovery(),   // recover NET Reactor "Hide Method Calls" stubs
+                new PostDeobfuscation(),
+                new StringDecryption(),
+                new ResourceDecryption()
             };
         }
 
@@ -178,12 +187,30 @@ namespace Krypton.Pipeline
             var allowStabilizationOnlyOutput = GetFeatureToggle(
                 "KRYPTON_ALLOW_STABILIZATION_ONLY_OUTPUT",
                 defaultEnabled: false);
-            if (methodsToPatch.Count == 0 && !allowStabilizationOnlyOutput)
+            var enableNecrobitBodyRestore = GetFeatureToggle(
+                "KRYPTON_ENABLE_NECROBIT_BODY_RESTORE",
+                defaultEnabled: true,
+                disableVariableName: "KRYPTON_DISABLE_NECROBIT_BODY_RESTORE");
+            var restoredNecrobitBodies = enableNecrobitBodyRestore
+                ? RestoreNecrobitMethodBodies(Ctx.Module)
+                : 0;
+            if (restoredNecrobitBodies > 0)
+            {
+                Ctx.Options.Logger.Warning(
+                    $"Restored {restoredNecrobitBodies} NecroBit runtime method body/bodies from Hashtable dump.");
+            }
+
+            if (methodsToPatch.Count == 0 && !allowStabilizationOnlyOutput && restoredNecrobitBodies == 0)
                 return false;
             if (methodsToPatch.Count == 0 && allowStabilizationOnlyOutput)
             {
                 Ctx.Options.Logger.Info(
                     "Proceeding without method-body patches because stabilization-only output is enabled.");
+            }
+            else if (methodsToPatch.Count == 0 && restoredNecrobitBodies > 0)
+            {
+                Ctx.Options.Logger.Info(
+                    "Proceeding with NecroBit-restored method bodies even though no VM recompilation patches were queued.");
             }
 
             var tempPath = Path.Combine(
@@ -302,6 +329,108 @@ namespace Krypton.Pipeline
                     }
                 }
 
+                var enableAesFinalBlockRepair = GetFeatureToggle(
+                    "KRYPTON_ENABLE_AES_FINAL_BLOCK_REPAIR",
+                    defaultEnabled: true,
+                    disableVariableName: "KRYPTON_DISABLE_AES_FINAL_BLOCK_REPAIR");
+                if (enableAesFinalBlockRepair)
+                {
+                    var repairedAesFinalBlocks = RepairAesTransformFinalBlockLengthPatterns(Ctx.Module);
+                    if (repairedAesFinalBlocks > 0)
+                    {
+                        Ctx.Options.Logger.Warning(
+                            $"Repaired {repairedAesFinalBlocks} AES TransformFinalBlock length expression(s).");
+                    }
+                }
+
+                var enableStaticDataCctorRepair = GetFeatureToggle(
+                    "KRYPTON_ENABLE_STATIC_DATA_CCTOR_REPAIR",
+                    defaultEnabled: true,
+                    disableVariableName: "KRYPTON_DISABLE_STATIC_DATA_CCTOR_REPAIR");
+                if (enableStaticDataCctorRepair)
+                {
+                    var repairedStaticDataCctors = RepairStaticDataInitializers(Ctx.Module);
+                    if (repairedStaticDataCctors > 0)
+                    {
+                        Ctx.Options.Logger.Warning(
+                            $"Repaired {repairedStaticDataCctors} static data initializer(s).");
+                    }
+                }
+
+                var enableWinFormsFormRepair = GetFeatureToggle(
+                    "KRYPTON_ENABLE_WINFORMS_FORM_REPAIR",
+                    defaultEnabled: true,
+                    disableVariableName: "KRYPTON_DISABLE_WINFORMS_FORM_REPAIR");
+                if (enableWinFormsFormRepair)
+                {
+                    var repairedWinFormsForms = RepairWindowsFormsFormConstructors(Ctx.Module);
+                    if (repairedWinFormsForms > 0)
+                    {
+                        Ctx.Options.Logger.Warning(
+                            $"Rebuilt {repairedWinFormsForms} WinForms form constructor(s).");
+                    }
+                }
+
+                var enableWinFormsDisposeRepair = GetFeatureToggle(
+                    "KRYPTON_ENABLE_WINFORMS_DISPOSE_REPAIR",
+                    defaultEnabled: true,
+                    disableVariableName: "KRYPTON_DISABLE_WINFORMS_DISPOSE_REPAIR");
+                if (enableWinFormsDisposeRepair)
+                {
+                    var repairedWinFormsDisposeMethods = RepairWindowsFormsDisposeMethods(Ctx.Module);
+                    if (repairedWinFormsDisposeMethods > 0)
+                    {
+                        Ctx.Options.Logger.Warning(
+                            $"Rebuilt {repairedWinFormsDisposeMethods} WinForms Dispose(bool) method(s).");
+                    }
+                }
+
+                var enableWinFormsEntryPointRepair = GetFeatureToggle(
+                    "KRYPTON_ENABLE_WINFORMS_ENTRYPOINT_REPAIR",
+                    defaultEnabled: true,
+                    disableVariableName: "KRYPTON_DISABLE_WINFORMS_ENTRYPOINT_REPAIR");
+                if (enableWinFormsEntryPointRepair)
+                {
+                    var repairedWinFormsEntryPoints = RepairWindowsFormsDelegateEntryPoint(Ctx.Module);
+                    if (repairedWinFormsEntryPoints > 0)
+                    {
+                        Ctx.Options.Logger.Warning(
+                            $"Rebuilt {repairedWinFormsEntryPoints} WinForms delegate-based entry point(s).");
+                    }
+                }
+
+                var enableAntiIldasmStrip = GetFeatureToggle(
+                    "KRYPTON_ENABLE_ANTI_ILDASM_STRIP",
+                    defaultEnabled: true,
+                    disableVariableName: "KRYPTON_DISABLE_ANTI_ILDASM_STRIP");
+                if (enableAntiIldasmStrip)
+                {
+                    var strippedAntiIldasmAttributes = StripAntiIldasmAttributes(Ctx.Module);
+                    if (strippedAntiIldasmAttributes > 0)
+                    {
+                        Ctx.Options.Logger.Warning(
+                            $"Stripped {strippedAntiIldasmAttributes} Anti-ILDASM attribute(s).");
+                    }
+                }
+
+                var enableReactorRuntimeCleanup = GetFeatureToggle(
+                    "KRYPTON_ENABLE_REACTOR_RUNTIME_CLEANUP",
+                    defaultEnabled: true,
+                    disableVariableName: "KRYPTON_DISABLE_REACTOR_RUNTIME_CLEANUP");
+                if (enableReactorRuntimeCleanup)
+                {
+                    var cleanup = CleanUnusedReactorRuntime(Ctx.Module);
+                    if (cleanup.TotalChanges > 0)
+                    {
+                        Ctx.Options.Logger.Warning(
+                            "Cleaned unused NET Reactor runtime: " +
+                            $"{cleanup.StubbedMethods} method body/bodies stubbed, " +
+                            $"{cleanup.DisabledPInvokes} P/Invoke import(s) disabled, " +
+                            $"{cleanup.RuntimeTypes} runtime-looking type(s) analyzed, " +
+                            $"{cleanup.ReachableMethods} reachable method(s) preserved.");
+                    }
+                }
+
                 // Preserve definition table indices/tokens to avoid breaking protectors that do token-based runtime lookups.
                 // Do not preserve all tables: some samples contain duplicate member refs that fail full token preservation.
                 var metadataBuilderFlags =
@@ -328,7 +457,7 @@ namespace Krypton.Pipeline
 
                 var disableStartupGuard = GetFeatureToggle(
                     "KRYPTON_DISABLE_STARTUP_GUARD",
-                    defaultEnabled: false);
+                    defaultEnabled: true);
                 if (disableStartupGuard)
                 {
                     var disableAllBootstrapCctors = string.Equals(
@@ -1717,6 +1846,3081 @@ namespace Krypton.Pipeline
                    string.Equals(signature.ParameterTypes[0].FullName, "System.Int32", StringComparison.Ordinal);
         }
 
+        private int RepairWindowsFormsDelegateEntryPoint(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            var entry = module?.ManagedEntryPoint as AsmResolver.DotNet.MethodDefinition;
+            if (entry?.CilMethodBody == null)
+                return 0;
+
+            if (!TryFindConstructedWindowsFormsCtor(module, entry.CilMethodBody, out var formCtor))
+                return 0;
+
+            if (!UsesDelegateInvokeWrappers(entry.CilMethodBody))
+                return 0;
+
+            if (!TryBuildWindowsFormsApplicationReferences(
+                    module,
+                    formCtor,
+                    out var enableStyles,
+                    out var setCompatibleTextRenderingDefault,
+                    out var run))
+            {
+                return 0;
+            }
+
+            var replacement = new CilMethodBody(entry)
+            {
+                InitializeLocals = false,
+                ComputeMaxStackOnBuild = true
+            };
+            replacement.Instructions.Add(new CilInstruction(CilOpCodes.Call, enableStyles));
+            replacement.Instructions.Add(new CilInstruction(CilOpCodes.Ldc_I4_0));
+            replacement.Instructions.Add(new CilInstruction(CilOpCodes.Call, setCompatibleTextRenderingDefault));
+            replacement.Instructions.Add(new CilInstruction(CilOpCodes.Newobj, formCtor));
+            replacement.Instructions.Add(new CilInstruction(CilOpCodes.Call, run));
+            replacement.Instructions.Add(new CilInstruction(CilOpCodes.Ret));
+
+            entry.CilMethodBody = replacement;
+            return 1;
+        }
+
+        private bool TryFindConstructedWindowsFormsCtor(
+            AsmResolver.DotNet.ModuleDefinition module,
+            CilMethodBody body,
+            out IMethodDescriptor formCtor)
+        {
+            formCtor = null;
+            if (body?.Instructions == null)
+                return false;
+
+            foreach (var instruction in body.Instructions)
+            {
+                if (instruction.OpCode.Code != CilCode.Newobj)
+                    continue;
+
+                var ctor = instruction.Operand as IMethodDescriptor;
+                if (ctor == null || ctor.Signature == null || ctor.Signature.ParameterTypes.Count != 0)
+                    continue;
+
+                if (IsWindowsFormsFormConstructor(ctor))
+                {
+                    formCtor = ctor;
+                    return true;
+                }
+            }
+
+            formCtor = FindFirstWindowsFormsFormCtor(module);
+            return formCtor != null;
+        }
+
+        private bool IsWindowsFormsFormConstructor(IMethodDescriptor ctor)
+        {
+            if (ctor?.DeclaringType == null)
+                return false;
+
+            try
+            {
+                var declaringType = ctor.DeclaringType.Resolve();
+                return string.Equals(
+                    declaringType?.BaseType?.FullName,
+                    "System.Windows.Forms.Form",
+                    StringComparison.Ordinal);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private IMethodDescriptor FindFirstWindowsFormsFormCtor(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            if (module == null)
+                return null;
+
+            foreach (var type in module.GetAllTypes())
+            {
+                if (!string.Equals(type.BaseType?.FullName, "System.Windows.Forms.Form", StringComparison.Ordinal))
+                    continue;
+
+                foreach (var method in type.Methods)
+                {
+                    if (!method.IsConstructor || method.IsStatic || method.Signature == null)
+                        continue;
+                    if (method.Signature.ParameterTypes.Count == 0)
+                        return method;
+                }
+            }
+
+            return null;
+        }
+
+        private bool UsesDelegateInvokeWrappers(CilMethodBody body)
+        {
+            if (body?.Instructions == null)
+                return false;
+
+            foreach (var instruction in body.Instructions)
+            {
+                if (instruction.OpCode.Code != CilCode.Call && instruction.OpCode.Code != CilCode.Callvirt)
+                    continue;
+
+                var descriptor = instruction.Operand as IMethodDescriptor;
+                if (descriptor == null)
+                    continue;
+
+                AsmResolver.DotNet.MethodDefinition resolved;
+                try
+                {
+                    resolved = descriptor.Resolve();
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (IsDelegateInvokeWrapper(resolved))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private bool IsDelegateInvokeWrapper(AsmResolver.DotNet.MethodDefinition method)
+        {
+            var body = method?.CilMethodBody;
+            if (body == null || body.Instructions.Count > 12)
+                return false;
+
+            foreach (var instruction in body.Instructions)
+            {
+                if (instruction.OpCode.Code != CilCode.Callvirt && instruction.OpCode.Code != CilCode.Call)
+                    continue;
+
+                var descriptor = instruction.Operand as IMethodDescriptor;
+                if (descriptor == null)
+                    continue;
+
+                if (string.Equals(descriptor.Name, "Invoke", StringComparison.Ordinal))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private bool TryBuildWindowsFormsApplicationReferences(
+            AsmResolver.DotNet.ModuleDefinition module,
+            IMethodDescriptor formCtor,
+            out IMethodDescriptor enableStyles,
+            out IMethodDescriptor setCompatibleTextRenderingDefault,
+            out IMethodDescriptor run)
+        {
+            enableStyles = null;
+            setCompatibleTextRenderingDefault = null;
+            run = null;
+
+            var formType = FindWindowsFormsFormTypeReference(module, formCtor);
+            var formTypeReference = formType as AsmResolver.DotNet.TypeReference;
+            if (module == null || formType == null || formTypeReference?.Scope == null)
+                return false;
+
+            var applicationType = new AsmResolver.DotNet.TypeReference(
+                module,
+                formTypeReference.Scope,
+                "System.Windows.Forms",
+                "Application");
+
+            var corLib = module.CorLibTypeFactory;
+            enableStyles = new AsmResolver.DotNet.MemberReference(
+                applicationType,
+                "EnableVisualStyles",
+                MethodSignature.CreateStatic(corLib.Void));
+            setCompatibleTextRenderingDefault = new AsmResolver.DotNet.MemberReference(
+                applicationType,
+                "SetCompatibleTextRenderingDefault",
+                MethodSignature.CreateStatic(corLib.Void, corLib.Boolean));
+            run = new AsmResolver.DotNet.MemberReference(
+                applicationType,
+                "Run",
+                MethodSignature.CreateStatic(corLib.Void, new TypeDefOrRefSignature(formType)));
+
+            return true;
+        }
+
+        private ITypeDefOrRef FindWindowsFormsFormTypeReference(
+            AsmResolver.DotNet.ModuleDefinition module,
+            IMethodDescriptor formCtor)
+        {
+            try
+            {
+                var declaringType = formCtor?.DeclaringType?.Resolve();
+                if (string.Equals(declaringType?.BaseType?.FullName, "System.Windows.Forms.Form", StringComparison.Ordinal))
+                    return declaringType.BaseType;
+            }
+            catch
+            {
+                // Fallback to scanning all type definitions below.
+            }
+
+            if (module == null)
+                return null;
+
+            foreach (var type in module.GetAllTypes())
+            {
+                if (string.Equals(type.BaseType?.FullName, "System.Windows.Forms.Form", StringComparison.Ordinal))
+                    return type.BaseType;
+            }
+
+            return null;
+        }
+
+        private int RepairWindowsFormsFormConstructors(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            if (module == null)
+                return 0;
+
+            var formSnapshots = LoadWinFormsSnapshots();
+            var repaired = 0;
+            foreach (var type in module.GetAllTypes())
+            {
+                if (!string.Equals(type.BaseType?.FullName, "System.Windows.Forms.Form", StringComparison.Ordinal))
+                    continue;
+
+                var ctor = type.Methods.FirstOrDefault(m =>
+                    m.IsConstructor &&
+                    !m.IsStatic &&
+                    m.Signature != null &&
+                    m.Signature.ParameterTypes.Count == 0 &&
+                    m.CilMethodBody != null);
+                if (ctor == null || !LooksLikeEmptyMethodBody(ctor.CilMethodBody))
+                    continue;
+
+                if (!TryBuildWindowsFormsControlReferences(module, type.BaseType, out var refs))
+                    continue;
+
+                if (TryGetWinFormsSnapshot(formSnapshots, type, out var snapshot) &&
+                    IsUsableWinFormsSnapshot(snapshot) &&
+                    TryRewriteWindowsFormsConstructorFromSnapshot(ctor, type, snapshot, refs))
+                {
+                    repaired++;
+                    continue;
+                }
+
+                // Generic path: if there is an InitializeComponent-like method that was
+                // already patched by HiddenCallRecovery, just emit base..ctor + call it.
+                var initComp = FindInitializeComponentMethod(type);
+                if (initComp != null)
+                {
+                    RewriteConstructorWithInitializeComponent(ctor, initComp, refs);
+                    repaired++;
+                    continue;
+                }
+
+                // Fallback: no InitializeComponent found — attempt structural reconstruction
+                // using type-inspection (requires a TextBox field and a click handler).
+                // Optional last-resort heuristic. This is not original designer recovery:
+                // it fabricates a minimal UI from type shape, so keep it opt-in.
+                if (!IsWinFormsHeuristicFallbackEnabled())
+                {
+                    Ctx?.Options?.Logger?.Warning(
+                        $"WinForms UI for {type.FullName} was not recovered from runtime snapshot or InitializeComponent payload. " +
+                        "Set KRYPTON_WINFORMS_HEURISTIC_FALLBACK=1 to emit the old synthetic fallback.");
+                    continue;
+                }
+
+                var textBoxField = FindInstanceFieldOfType(type, "System.Windows.Forms.TextBox");
+                var clickHandler = FindWindowsFormsClickHandler(type);
+                if (textBoxField == null || clickHandler == null)
+                    continue;
+
+                RewriteWindowsFormsConstructor(ctor, textBoxField, clickHandler, refs);
+                repaired++;
+            }
+
+            return repaired;
+        }
+
+        private int RepairWindowsFormsDisposeMethods(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            if (module == null)
+                return 0;
+
+            var repaired = 0;
+            foreach (var type in module.GetAllTypes())
+            {
+                if (!IsWindowsFormsFormType(type))
+                    continue;
+
+                var dispose = FindWindowsFormsDisposeBoolMethod(type);
+                if (dispose?.CilMethodBody == null)
+                    continue;
+                if (!ShouldRewriteWindowsFormsDispose(dispose))
+                    continue;
+
+                if (!TryBuildWindowsFormsControlReferences(module, type.BaseType, out var refs))
+                    continue;
+                if (refs.FormDisposeBool == null || refs.DisposableDispose == null)
+                    continue;
+
+                var componentsField = FindWindowsFormsComponentsField(type);
+                RewriteWindowsFormsDisposeMethod(dispose, componentsField, refs);
+                repaired++;
+            }
+
+            return repaired;
+        }
+
+        private static AsmResolver.DotNet.MethodDefinition FindWindowsFormsDisposeBoolMethod(
+            AsmResolver.DotNet.TypeDefinition type)
+        {
+            if (type == null)
+                return null;
+
+            foreach (var method in type.Methods)
+            {
+                if (method.IsStatic || method.Signature == null)
+                    continue;
+                if (!string.Equals(method.Name, "Dispose", StringComparison.Ordinal))
+                    continue;
+                if (!string.Equals(method.Signature.ReturnType?.FullName, "System.Void", StringComparison.Ordinal))
+                    continue;
+                if (method.Signature.ParameterTypes.Count != 1)
+                    continue;
+                if (!string.Equals(method.Signature.ParameterTypes[0].FullName, "System.Boolean", StringComparison.Ordinal))
+                    continue;
+
+                return method;
+            }
+
+            return null;
+        }
+
+        private bool ShouldRewriteWindowsFormsDispose(AsmResolver.DotNet.MethodDefinition method)
+        {
+            var body = method?.CilMethodBody;
+            if (body == null)
+                return false;
+
+            if (LooksLikeEmptyMethodBody(body))
+                return true;
+
+            // A valid WinForms Dispose(bool) override must eventually delegate to
+            // Form.Dispose(bool). If it is a tiny protected stub that does not, the
+            // close path can be left half-alive after devirtualization.
+            return body.Instructions.Count <= 8 && !CallsWindowsFormsBaseDispose(body);
+        }
+
+        private static bool CallsWindowsFormsBaseDispose(CilMethodBody body)
+        {
+            foreach (var instruction in body.Instructions)
+            {
+                if (instruction.OpCode.Code != CilCode.Call &&
+                    instruction.OpCode.Code != CilCode.Callvirt)
+                {
+                    continue;
+                }
+
+                if (!(instruction.Operand is IMethodDescriptor descriptor))
+                    continue;
+                if (!string.Equals(descriptor.Name, "Dispose", StringComparison.Ordinal))
+                    continue;
+
+                var signature = descriptor.Signature;
+                if (signature == null || signature.ParameterTypes.Count != 1)
+                    continue;
+                if (!string.Equals(signature.ParameterTypes[0].FullName, "System.Boolean", StringComparison.Ordinal))
+                    continue;
+                if (string.Equals(
+                        descriptor.DeclaringType?.FullName,
+                        "System.Windows.Forms.Form",
+                        StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static AsmResolver.DotNet.FieldDefinition FindWindowsFormsComponentsField(
+            AsmResolver.DotNet.TypeDefinition type)
+        {
+            if (type == null)
+                return null;
+
+            return type.Fields.FirstOrDefault(field =>
+                !field.IsStatic &&
+                string.Equals(
+                    field.Signature?.FieldType?.FullName,
+                    "System.ComponentModel.IContainer",
+                    StringComparison.Ordinal));
+        }
+
+        private static void RewriteWindowsFormsDisposeMethod(
+            AsmResolver.DotNet.MethodDefinition dispose,
+            AsmResolver.DotNet.FieldDefinition componentsField,
+            WindowsFormsControlReferences refs)
+        {
+            var body = new CilMethodBody(dispose)
+            {
+                InitializeLocals = false,
+                ComputeMaxStackOnBuild = true
+            };
+
+            var il = body.Instructions;
+            var callBase = new CilInstruction(CilOpCodes.Ldarg_0);
+
+            if (componentsField != null)
+            {
+                il.Add(new CilInstruction(CilOpCodes.Ldarg_1));
+                il.Add(new CilInstruction(CilOpCodes.Brfalse, new CilInstructionLabel(callBase)));
+                il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+                il.Add(new CilInstruction(CilOpCodes.Ldfld, componentsField));
+                il.Add(new CilInstruction(CilOpCodes.Brfalse, new CilInstructionLabel(callBase)));
+                il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+                il.Add(new CilInstruction(CilOpCodes.Ldfld, componentsField));
+                il.Add(new CilInstruction(CilOpCodes.Callvirt, refs.DisposableDispose));
+            }
+
+            il.Add(callBase);
+            il.Add(new CilInstruction(CilOpCodes.Ldarg_1));
+            il.Add(new CilInstruction(CilOpCodes.Call, refs.FormDisposeBool));
+            il.Add(new CilInstruction(CilOpCodes.Ret));
+
+            dispose.CilMethodBody = body;
+        }
+
+        private static bool IsWinFormsHeuristicFallbackEnabled()
+        {
+            var value = Environment.GetEnvironmentVariable("KRYPTON_WINFORMS_HEURISTIC_FALLBACK");
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            value = value.Trim();
+            return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(value, "on", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private List<WinFormsSnapshot> LoadWinFormsSnapshots()
+        {
+            var results = new List<WinFormsSnapshot>();
+            var originalPath = Ctx?.Options?.FilePath;
+            if (string.IsNullOrWhiteSpace(originalPath))
+                return results;
+
+            var dumpPath = Path.ChangeExtension(originalPath, null) + "-dynamic-dump.json";
+            if (!File.Exists(dumpPath))
+                return results;
+
+            try
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(dumpPath));
+                if (!doc.RootElement.TryGetProperty("Forms", out var forms) ||
+                    forms.ValueKind != JsonValueKind.Array)
+                {
+                    return results;
+                }
+
+                foreach (var form in forms.EnumerateArray())
+                {
+                    var snapshot = new WinFormsSnapshot
+                    {
+                        TypeName = ReadString(form, "TypeName"),
+                        TypeToken = ReadString(form, "TypeToken"),
+                        Text = ReadString(form, "Text"),
+                        ClientWidth = ReadNullableInt(form, "ClientWidth"),
+                        ClientHeight = ReadNullableInt(form, "ClientHeight"),
+                        FormBorderStyle = ReadNullableInt(form, "FormBorderStyle"),
+                        StartPosition = ReadNullableInt(form, "StartPosition"),
+                        MaximizeBox = ReadNullableBool(form, "MaximizeBox"),
+                        MinimizeBox = ReadNullableBool(form, "MinimizeBox"),
+                        AutoScaleMode = ReadNullableInt(form, "AutoScaleMode"),
+                        AutoScaleWidth = ReadNullableFloat(form, "AutoScaleWidth"),
+                        AutoScaleHeight = ReadNullableFloat(form, "AutoScaleHeight"),
+                    };
+
+                    if (form.TryGetProperty("Controls", out var controls) &&
+                        controls.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var control in controls.EnumerateArray())
+                            snapshot.Controls.Add(ReadControlSnapshot(control));
+                    }
+
+                    results.Add(snapshot);
+                }
+            }
+            catch (Exception ex)
+            {
+                Ctx?.Options?.Logger?.Warning(
+                    $"Failed to read WinForms snapshots from dynamic dump: {ex.Message}");
+            }
+
+            results.AddRange(LoadWinFormsPayloadSnapshots());
+            return results;
+        }
+
+        private List<WinFormsSnapshot> LoadWinFormsPayloadSnapshots()
+        {
+            var results = new List<WinFormsSnapshot>();
+            var originalPath = Ctx?.Options?.FilePath;
+            var module = Ctx?.Module;
+            if (module == null || string.IsNullOrWhiteSpace(originalPath) || !File.Exists(originalPath))
+                return results;
+
+            var tracePath = Path.ChangeExtension(originalPath, null) + "-payload-trace.json";
+            if (!File.Exists(tracePath) && !InvokeRunner(
+                    "--payload-trace",
+                    originalPath,
+                    tracePath,
+                    "WinFormsPayload"))
+            {
+                return results;
+            }
+
+            var hcrMap = LoadHiddenCallMap();
+            if (hcrMap.Count == 0)
+                return results;
+
+            var buffers = ReadPayloadTraceBuffers(tracePath).ToList();
+            if (buffers.Count == 0)
+                return results;
+
+            foreach (var type in module.GetAllTypes())
+            {
+                if (!string.Equals(type.BaseType?.FullName, "System.Windows.Forms.Form", StringComparison.Ordinal))
+                    continue;
+
+                var controlFields = type.Fields
+                    .Where(IsWinFormsControlField)
+                    .ToList();
+                if (controlFields.Count == 0)
+                    continue;
+
+                var best = SelectBestPayloadBuffer(buffers, controlFields);
+                if (best == null)
+                    continue;
+
+                var instructions = ParseRawIl(best.Data);
+                if (instructions.Count == 0)
+                    continue;
+
+                var decoderToken = FindStringDecoderToken(module, instructions);
+                var fieldValues = ResolveRuntimeFieldValues(originalPath, instructions, decoderToken);
+                var decodedStrings = DecodeRuntimeStrings(originalPath, decoderToken, instructions, fieldValues);
+                if (TryBuildWinFormsSnapshotFromPayload(
+                        module,
+                        type,
+                        controlFields,
+                        instructions,
+                        hcrMap,
+                        fieldValues,
+                        decodedStrings,
+                        out var snapshot))
+                {
+                    results.Add(snapshot);
+                    Ctx?.Options?.Logger?.Info(
+                        $"Recovered WinForms payload snapshot for {type.FullName} from {best.Name}.");
+                }
+            }
+
+            return results;
+        }
+
+        private Dictionary<uint, HiddenCallEntry> LoadHiddenCallMap()
+        {
+            var result = new Dictionary<uint, HiddenCallEntry>();
+            var originalPath = Ctx?.Options?.FilePath;
+            if (string.IsNullOrWhiteSpace(originalPath))
+                return result;
+
+            var dumpPath = Path.ChangeExtension(originalPath, null) + "-dynamic-dump.json";
+            if (!File.Exists(dumpPath))
+                return result;
+
+            try
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(dumpPath));
+                if (!doc.RootElement.TryGetProperty("Methods", out var methods) ||
+                    methods.ValueKind != JsonValueKind.Array)
+                {
+                    return result;
+                }
+
+                foreach (var entry in methods.EnumerateArray())
+                {
+                    var fieldToken = ExtractMetadataToken(ReadString(entry, "SourceField"));
+                    if (fieldToken == 0 ||
+                        !entry.TryGetProperty("Instructions", out var ins) ||
+                        ins.ValueKind != JsonValueKind.Array)
+                    {
+                        continue;
+                    }
+
+                    foreach (var instruction in ins.EnumerateArray())
+                    {
+                        if (!string.Equals(ReadString(instruction, "OperandKind"), "method", StringComparison.Ordinal))
+                            continue;
+                        if (string.Equals(ReadString(instruction, "MemberName"), "Invoke", StringComparison.Ordinal))
+                            continue;
+
+                        result[fieldToken] = new HiddenCallEntry
+                        {
+                            DeclaringType = ReadString(instruction, "DeclType"),
+                            MethodName = ReadString(instruction, "MemberName"),
+                            MemberSig = ReadString(instruction, "MemberSig")
+                        };
+                        break;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Ctx?.Options?.Logger?.Warning($"Failed to read hidden-call map for WinForms payload recovery: {ex.Message}");
+            }
+
+            return result;
+        }
+
+        private static uint ExtractMetadataToken(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return 0;
+
+            var tokenText = text.Trim();
+            var pipe = tokenText.LastIndexOf('|');
+            if (pipe >= 0)
+                tokenText = tokenText.Substring(pipe + 1);
+
+            if (tokenText.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                tokenText = tokenText.Substring(2);
+
+            return uint.TryParse(
+                tokenText,
+                System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var token)
+                ? token
+                : 0;
+        }
+
+        private IEnumerable<PayloadBuffer> ReadPayloadTraceBuffers(string tracePath)
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(tracePath));
+            if (!doc.RootElement.TryGetProperty("Buffers", out var buffers) ||
+                buffers.ValueKind != JsonValueKind.Array)
+            {
+                yield break;
+            }
+
+            foreach (var buffer in buffers.EnumerateArray())
+            {
+                var base64 = ReadString(buffer, "Base64");
+                if (string.IsNullOrWhiteSpace(base64))
+                    continue;
+
+                byte[] data;
+                try
+                {
+                    data = Convert.FromBase64String(base64);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                buffer.TryGetProperty("Index", out var indexProp);
+                var index = indexProp.TryGetInt32(out var parsedIndex) ? parsedIndex : -1;
+                var source = ReadString(buffer, "Source") ?? "trace";
+                yield return new PayloadBuffer
+                {
+                    Name = $"trace #{index} {source}",
+                    Data = data
+                };
+            }
+        }
+
+        private static PayloadBuffer SelectBestPayloadBuffer(
+            List<PayloadBuffer> buffers,
+            List<AsmResolver.DotNet.FieldDefinition> controlFields)
+        {
+            var fieldTokens = controlFields
+                .Select(f => f.MetadataToken.ToUInt32())
+                .Where(t => t != 0)
+                .ToList();
+
+            return buffers
+                .Select(b => new
+                {
+                    Buffer = b,
+                    Hits = fieldTokens.Sum(t => CountTokenHits(b.Data, t)),
+                    DistinctHits = fieldTokens.Count(t => CountTokenHits(b.Data, t) > 0)
+                })
+                .Where(x => x.DistinctHits >= Math.Min(2, fieldTokens.Count))
+                .OrderByDescending(x => x.Hits)
+                .ThenByDescending(x => x.Buffer.Data.Length)
+                .Select(x => x.Buffer)
+                .FirstOrDefault();
+        }
+
+        private static int CountTokenHits(byte[] data, uint token)
+        {
+            var needle = BitConverter.GetBytes(token);
+            var count = 0;
+            for (var i = 0; i <= data.Length - 4; i++)
+            {
+                if (data[i] == needle[0] &&
+                    data[i + 1] == needle[1] &&
+                    data[i + 2] == needle[2] &&
+                    data[i + 3] == needle[3])
+                {
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        private static bool IsWinFormsControlField(AsmResolver.DotNet.FieldDefinition field)
+        {
+            if (field == null || field.IsStatic)
+                return false;
+
+            var typeName = field.Signature?.FieldType?.FullName;
+            return string.Equals(typeName, "System.Windows.Forms.TextBox", StringComparison.Ordinal) ||
+                   string.Equals(typeName, "System.Windows.Forms.Button", StringComparison.Ordinal) ||
+                   string.Equals(typeName, "System.Windows.Forms.CheckBox", StringComparison.Ordinal) ||
+                   string.Equals(typeName, "System.Windows.Forms.RadioButton", StringComparison.Ordinal) ||
+                   string.Equals(typeName, "System.Windows.Forms.Label", StringComparison.Ordinal);
+        }
+
+        private static List<RawIlInstruction> ParseRawIl(byte[] data)
+        {
+            var result = new List<RawIlInstruction>();
+            var p = 0;
+            while (p < data.Length)
+            {
+                var offset = p;
+                var first = data[p++];
+                var op = first == 0xFE && p < data.Length
+                    ? 0xFE00 | data[p++]
+                    : first;
+
+                var instruction = new RawIlInstruction { Offset = offset, Op = op };
+                switch (op)
+                {
+                    case 0x15: instruction.Int32 = -1; break;
+                    case 0x16: instruction.Int32 = 0; break;
+                    case 0x17: instruction.Int32 = 1; break;
+                    case 0x18: instruction.Int32 = 2; break;
+                    case 0x19: instruction.Int32 = 3; break;
+                    case 0x1A: instruction.Int32 = 4; break;
+                    case 0x1B: instruction.Int32 = 5; break;
+                    case 0x1C: instruction.Int32 = 6; break;
+                    case 0x1D: instruction.Int32 = 7; break;
+                    case 0x1E: instruction.Int32 = 8; break;
+                    case 0x1F:
+                        if (p + 1 > data.Length) return result;
+                        instruction.Int32 = unchecked((sbyte)data[p++]);
+                        break;
+                    case 0x20:
+                        if (p + 4 > data.Length) return result;
+                        instruction.Int32 = BitConverter.ToInt32(data, p);
+                        p += 4;
+                        break;
+                    case 0x22:
+                        if (p + 4 > data.Length) return result;
+                        instruction.Single = BitConverter.ToSingle(data, p);
+                        p += 4;
+                        break;
+                    case 0x23:
+                        if (p + 8 > data.Length) return result;
+                        p += 8;
+                        break;
+                    case 0x2B:
+                    case 0x0E:
+                    case 0x10:
+                    case 0x11:
+                    case 0x13:
+                        if (p + 1 > data.Length) return result;
+                        p++;
+                        break;
+                    case 0x38:
+                    case 0x39:
+                    case 0x3A:
+                    case 0x3B:
+                    case 0x3C:
+                    case 0x3D:
+                    case 0x3E:
+                    case 0x3F:
+                    case 0x40:
+                    case 0x41:
+                    case 0x42:
+                    case 0x43:
+                    case 0x44:
+                        if (p + 4 > data.Length) return result;
+                        p += 4;
+                        break;
+                    case 0x45:
+                        if (p + 4 > data.Length) return result;
+                        var count = BitConverter.ToInt32(data, p);
+                        p += 4;
+                        if (count < 0 || count > 4096 || p + count * 4 > data.Length) return result;
+                        p += count * 4;
+                        break;
+                    case 0x28:
+                    case 0x6F:
+                    case 0x70:
+                    case 0x71:
+                    case 0x72:
+                    case 0x73:
+                    case 0x74:
+                    case 0x75:
+                    case 0x7B:
+                    case 0x7C:
+                    case 0x7D:
+                    case 0x7E:
+                    case 0xFE06:
+                        if (p + 4 > data.Length) return result;
+                        instruction.Token = BitConverter.ToUInt32(data, p);
+                        p += 4;
+                        break;
+                    case 0xFE09:
+                    case 0xFE0B:
+                    case 0xFE0C:
+                    case 0xFE0E:
+                        if (p + 2 > data.Length) return result;
+                        p += 2;
+                        break;
+                }
+
+                result.Add(instruction);
+            }
+
+            return result;
+        }
+
+        private static uint FindStringDecoderToken(
+            AsmResolver.DotNet.ModuleDefinition module,
+            List<RawIlInstruction> instructions)
+        {
+            foreach (var instruction in instructions)
+            {
+                if (instruction.Op != 0x28 && instruction.Op != 0x6F)
+                    continue;
+                if (instruction.Token == 0)
+                    continue;
+
+                var method = TryFindMethodByToken(module, instruction.Token);
+                if (method?.Signature == null)
+                    continue;
+                if (method.Signature.ParameterTypes.Count == 1 &&
+                    string.Equals(method.Signature.ParameterTypes[0].FullName, "System.Int32", StringComparison.Ordinal) &&
+                    string.Equals(method.Signature.ReturnType?.FullName, "System.String", StringComparison.Ordinal))
+                {
+                    return instruction.Token;
+                }
+            }
+
+            return 0x0600005C;
+        }
+
+        private Dictionary<uint, int> ResolveRuntimeFieldValues(
+            string originalPath,
+            List<RawIlInstruction> instructions,
+            uint decoderToken)
+        {
+            var needed = new HashSet<uint>();
+            for (var i = 0; i < instructions.Count; i++)
+            {
+                if ((instructions[i].Op != 0x28 && instructions[i].Op != 0x6F) ||
+                    instructions[i].Token != decoderToken)
+                {
+                    continue;
+                }
+
+                var position = i - 1;
+                TryEvaluateRawInt(instructions, ref position, new Dictionary<uint, int>(), out _, needed);
+            }
+
+            if (needed.Count == 0)
+                return new Dictionary<uint, int>();
+
+            var outPath = Path.ChangeExtension(originalPath, null) + "-payload-fields.json";
+            if (!InvokeRunner(
+                    "--dump-fields",
+                    originalPath,
+                    outPath,
+                    "WinFormsPayload",
+                    needed.Select(t => "0x" + t.ToString("X8")).ToArray()))
+            {
+                return new Dictionary<uint, int>();
+            }
+
+            return ReadRuntimeFieldValues(outPath);
+        }
+
+        private Dictionary<int, string> DecodeRuntimeStrings(
+            string originalPath,
+            uint decoderToken,
+            List<RawIlInstruction> instructions,
+            Dictionary<uint, int> fieldValues)
+        {
+            var indices = new List<int>();
+            for (var i = 0; i < instructions.Count; i++)
+            {
+                if ((instructions[i].Op != 0x28 && instructions[i].Op != 0x6F) ||
+                    instructions[i].Token != decoderToken)
+                {
+                    continue;
+                }
+
+                var position = i - 1;
+                if (TryEvaluateRawInt(instructions, ref position, fieldValues, out var index, null))
+                    indices.Add(index);
+            }
+
+            indices = indices.Distinct().ToList();
+            if (indices.Count == 0)
+                return new Dictionary<int, string>();
+
+            var outPath = Path.ChangeExtension(originalPath, null) + "-payload-strings.json";
+            var extra = new List<string> { "0x" + decoderToken.ToString("X8") };
+            extra.AddRange(indices.Select(i => i.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+            if (!InvokeRunner(
+                    "--eval-strings",
+                    originalPath,
+                    outPath,
+                    "WinFormsPayload",
+                    extra.ToArray()))
+            {
+                return new Dictionary<int, string>();
+            }
+
+            return ReadRuntimeStrings(outPath);
+        }
+
+        private static Dictionary<uint, int> ReadRuntimeFieldValues(string path)
+        {
+            var result = new Dictionary<uint, int>();
+            if (!File.Exists(path))
+                return result;
+
+            using var doc = JsonDocument.Parse(File.ReadAllText(path));
+            if (!doc.RootElement.TryGetProperty("Fields", out var fields) ||
+                fields.ValueKind != JsonValueKind.Array)
+            {
+                return result;
+            }
+
+            foreach (var field in fields.EnumerateArray())
+            {
+                var token = ExtractMetadataToken(ReadString(field, "Token"));
+                var valueText = ReadString(field, "Value");
+                if (token == 0 || !int.TryParse(valueText, out var value))
+                    continue;
+
+                result[token] = value;
+            }
+
+            return result;
+        }
+
+        private static Dictionary<int, string> ReadRuntimeStrings(string path)
+        {
+            var result = new Dictionary<int, string>();
+            if (!File.Exists(path))
+                return result;
+
+            using var doc = JsonDocument.Parse(File.ReadAllText(path));
+            if (!doc.RootElement.TryGetProperty("Strings", out var strings) ||
+                strings.ValueKind != JsonValueKind.Array)
+            {
+                return result;
+            }
+
+            foreach (var row in strings.EnumerateArray())
+            {
+                if (!row.TryGetProperty("Index", out var indexProp) ||
+                    !indexProp.TryGetInt32(out var index))
+                {
+                    continue;
+                }
+
+                var text = ReadString(row, "Text");
+                if (text != null)
+                    result[index] = text;
+            }
+
+            return result;
+        }
+
+        private bool TryBuildWinFormsSnapshotFromPayload(
+            AsmResolver.DotNet.ModuleDefinition module,
+            AsmResolver.DotNet.TypeDefinition formType,
+            List<AsmResolver.DotNet.FieldDefinition> controlFields,
+            List<RawIlInstruction> instructions,
+            Dictionary<uint, HiddenCallEntry> hcrMap,
+            Dictionary<uint, int> fieldValues,
+            Dictionary<int, string> decodedStrings,
+            out WinFormsSnapshot snapshot)
+        {
+            var payloadSnapshot = new WinFormsSnapshot
+            {
+                TypeName = formType.FullName,
+                TypeToken = "0x" + formType.MetadataToken.ToUInt32().ToString("X8")
+            };
+            snapshot = null;
+
+            var controlsByToken = new Dictionary<uint, WinFormsControlSnapshot>();
+            foreach (var field in controlFields)
+            {
+                var token = field.MetadataToken.ToUInt32();
+                controlsByToken[token] = new WinFormsControlSnapshot
+                {
+                    TypeName = field.Signature?.FieldType?.FullName,
+                    FieldName = field.Name,
+                    FieldToken = "0x" + token.ToString("X8")
+                };
+            }
+
+            var orderedControlTokens = new List<uint>();
+            void TouchControl(uint token)
+            {
+                if (token == 0 || !controlsByToken.ContainsKey(token))
+                    return;
+                if (!orderedControlTokens.Contains(token))
+                    orderedControlTokens.Add(token);
+            }
+
+            var decoderToken = FindStringDecoderToken(module, instructions);
+            var stringByCallIndex = new Dictionary<int, string>();
+            for (var i = 0; i < instructions.Count; i++)
+            {
+                if ((instructions[i].Op != 0x28 && instructions[i].Op != 0x6F) ||
+                    instructions[i].Token != decoderToken)
+                {
+                    continue;
+                }
+
+                var position = i - 1;
+                if (TryEvaluateRawInt(instructions, ref position, fieldValues, out var index, null) &&
+                    decodedStrings.TryGetValue(index, out var text))
+                {
+                    stringByCallIndex[i] = text;
+                }
+            }
+
+            for (var i = 0; i < instructions.Count; i++)
+            {
+                var instruction = instructions[i];
+                if (instruction.Op == 0x7D && instruction.Token != 0)
+                    TouchControl(instruction.Token);
+
+                if ((instruction.Op != 0x28 && instruction.Op != 0x6F) || i < 1)
+                    continue;
+
+                var hcrLoad = instructions[i - 1];
+                if (hcrLoad.Op != 0x7E || hcrLoad.Token == 0 ||
+                    !hcrMap.TryGetValue(hcrLoad.Token, out var hcr) ||
+                    string.IsNullOrEmpty(hcr.MethodName))
+                {
+                    continue;
+                }
+
+                switch (hcr.MethodName)
+                {
+                    case "set_Location":
+                        ApplyPointOrSizeSetter(instructions, i, controlsByToken, TouchControl, isLocation: true);
+                        break;
+                    case "set_Size":
+                        ApplyPointOrSizeSetter(instructions, i, controlsByToken, TouchControl, isLocation: false);
+                        break;
+                    case "set_TabIndex":
+                        ApplyControlIntSetter(instructions, i, controlsByToken, TouchControl, (c, v) => c.TabIndex = v);
+                        break;
+                    case "set_UseVisualStyleBackColor":
+                        ApplyControlIntSetter(instructions, i, controlsByToken, TouchControl, (c, v) => c.UseVisualStyleBackColor = v != 0);
+                        break;
+                    case "set_Name":
+                    case "set_Text":
+                        ApplyStringSetter(
+                            instructions,
+                            i,
+                            stringByCallIndex,
+                            fieldValues,
+                            controlsByToken,
+                            TouchControl,
+                            payloadSnapshot,
+                            hcr.MethodName);
+                        break;
+                    case "set_ClientSize":
+                        ApplyFormSizeSetter(instructions, i, payloadSnapshot);
+                        break;
+                    case "set_AutoScaleDimensions":
+                        ApplyFormScaleSetter(instructions, i, payloadSnapshot);
+                        break;
+                    case "set_AutoScaleMode":
+                        ApplyFormIntSetter(instructions, i, v => payloadSnapshot.AutoScaleMode = v);
+                        break;
+                    case "set_FormBorderStyle":
+                        ApplyFormIntSetter(instructions, i, v => payloadSnapshot.FormBorderStyle = v);
+                        break;
+                    case "set_StartPosition":
+                        ApplyFormIntSetter(instructions, i, v => payloadSnapshot.StartPosition = v);
+                        break;
+                    case "set_MaximizeBox":
+                        ApplyFormIntSetter(instructions, i, v => payloadSnapshot.MaximizeBox = v != 0);
+                        break;
+                    case "set_MinimizeBox":
+                        ApplyFormIntSetter(instructions, i, v => payloadSnapshot.MinimizeBox = v != 0);
+                        break;
+                }
+            }
+
+            foreach (var token in orderedControlTokens)
+            {
+                if (controlsByToken.TryGetValue(token, out var control))
+                    payloadSnapshot.Controls.Add(control);
+            }
+
+            if (payloadSnapshot.Controls.Count == 0 && !IsUsableWinFormsSnapshot(payloadSnapshot))
+                return false;
+
+            snapshot = payloadSnapshot;
+            return true;
+        }
+
+        private static void ApplyPointOrSizeSetter(
+            List<RawIlInstruction> instructions,
+            int callIndex,
+            Dictionary<uint, WinFormsControlSnapshot> controlsByToken,
+            Action<uint> touchControl,
+            bool isLocation)
+        {
+            if (callIndex < 5)
+                return;
+            var receiver = instructions[callIndex - 5];
+            if (receiver.Op != 0x7B || receiver.Token == 0 ||
+                !controlsByToken.TryGetValue(receiver.Token, out var control) ||
+                !TryGetRawInt(instructions[callIndex - 4], out var first) ||
+                !TryGetRawInt(instructions[callIndex - 3], out var second))
+            {
+                return;
+            }
+
+            if (isLocation)
+            {
+                control.Left = first;
+                control.Top = second;
+            }
+            else
+            {
+                control.Width = first;
+                control.Height = second;
+            }
+            touchControl(receiver.Token);
+        }
+
+        private static void ApplyControlIntSetter(
+            List<RawIlInstruction> instructions,
+            int callIndex,
+            Dictionary<uint, WinFormsControlSnapshot> controlsByToken,
+            Action<uint> touchControl,
+            Action<WinFormsControlSnapshot, int> assign)
+        {
+            if (callIndex < 3)
+                return;
+            var receiver = instructions[callIndex - 3];
+            if (receiver.Op != 0x7B || receiver.Token == 0 ||
+                !controlsByToken.TryGetValue(receiver.Token, out var control) ||
+                !TryGetRawInt(instructions[callIndex - 2], out var value))
+            {
+                return;
+            }
+
+            assign(control, value);
+            touchControl(receiver.Token);
+        }
+
+        private static void ApplyStringSetter(
+            List<RawIlInstruction> instructions,
+            int callIndex,
+            Dictionary<int, string> stringByCallIndex,
+            Dictionary<uint, int> fieldValues,
+            Dictionary<uint, WinFormsControlSnapshot> controlsByToken,
+            Action<uint> touchControl,
+            WinFormsSnapshot snapshot,
+            string setterName)
+        {
+            if (callIndex < 2)
+                return;
+
+            var decoderCallIndex = callIndex - 2;
+            if (!stringByCallIndex.TryGetValue(decoderCallIndex, out var value))
+                return;
+
+            var position = decoderCallIndex - 1;
+            if (!TryEvaluateRawInt(instructions, ref position, fieldValues, out _, null))
+                return;
+
+            var receiverIndex = position;
+            if (receiverIndex < 0)
+                return;
+
+            var receiver = instructions[receiverIndex];
+            if (receiver.Op == 0x02)
+            {
+                if (setterName == "set_Text")
+                    snapshot.Text = value;
+                return;
+            }
+
+            if (receiver.Op == 0x7B && receiver.Token != 0 &&
+                controlsByToken.TryGetValue(receiver.Token, out var control))
+            {
+                if (setterName == "set_Name")
+                    control.Name = value;
+                else if (setterName == "set_Text")
+                    control.Text = value;
+                touchControl(receiver.Token);
+            }
+        }
+
+        private static void ApplyFormSizeSetter(
+            List<RawIlInstruction> instructions,
+            int callIndex,
+            WinFormsSnapshot snapshot)
+        {
+            if (callIndex < 4 ||
+                !TryGetRawInt(instructions[callIndex - 4], out var width) ||
+                !TryGetRawInt(instructions[callIndex - 3], out var height))
+            {
+                return;
+            }
+
+            snapshot.ClientWidth = width;
+            snapshot.ClientHeight = height;
+        }
+
+        private static void ApplyFormScaleSetter(
+            List<RawIlInstruction> instructions,
+            int callIndex,
+            WinFormsSnapshot snapshot)
+        {
+            if (callIndex < 4 ||
+                !instructions[callIndex - 4].Single.HasValue ||
+                !instructions[callIndex - 3].Single.HasValue)
+            {
+                return;
+            }
+
+            snapshot.AutoScaleWidth = instructions[callIndex - 4].Single.Value;
+            snapshot.AutoScaleHeight = instructions[callIndex - 3].Single.Value;
+        }
+
+        private static void ApplyFormIntSetter(
+            List<RawIlInstruction> instructions,
+            int callIndex,
+            Action<int> assign)
+        {
+            if (callIndex < 2 || !TryGetRawInt(instructions[callIndex - 2], out var value))
+                return;
+
+            assign(value);
+        }
+
+        private static bool TryEvaluateRawInt(
+            List<RawIlInstruction> instructions,
+            ref int position,
+            Dictionary<uint, int> fieldValues,
+            out int value,
+            ISet<uint> missingFieldTokens)
+        {
+            value = 0;
+            if (position < 0 || position >= instructions.Count)
+                return false;
+
+            var instruction = instructions[position];
+            if (TryGetRawInt(instruction, out value))
+            {
+                position--;
+                return true;
+            }
+
+            switch (instruction.Op)
+            {
+                case 0x58:
+                    return TryEvaluateBinary(instructions, ref position, fieldValues, out value, missingFieldTokens, (a, b) => unchecked(a + b));
+                case 0x61:
+                    return TryEvaluateBinary(instructions, ref position, fieldValues, out value, missingFieldTokens, (a, b) => a ^ b);
+                case 0x62:
+                    return TryEvaluateBinary(instructions, ref position, fieldValues, out value, missingFieldTokens, (a, b) => a << (b & 31));
+                case 0x66:
+                    position--;
+                    if (!TryEvaluateRawInt(instructions, ref position, fieldValues, out var inner, missingFieldTokens))
+                        return false;
+                    value = ~inner;
+                    return true;
+                case 0x7B:
+                    if (instruction.Token == 0)
+                        return false;
+                    if (!fieldValues.TryGetValue(instruction.Token, out value))
+                    {
+                        if (missingFieldTokens != null)
+                        {
+                            missingFieldTokens.Add(instruction.Token);
+                            value = 0;
+                            position -= 2;
+                            return true;
+                        }
+                        return false;
+                    }
+                    position -= 2;
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private static bool TryEvaluateBinary(
+            List<RawIlInstruction> instructions,
+            ref int position,
+            Dictionary<uint, int> fieldValues,
+            out int value,
+            ISet<uint> missingFieldTokens,
+            Func<int, int, int> op)
+        {
+            value = 0;
+            position--;
+            if (!TryEvaluateRawInt(instructions, ref position, fieldValues, out var right, missingFieldTokens))
+                return false;
+            if (!TryEvaluateRawInt(instructions, ref position, fieldValues, out var left, missingFieldTokens))
+                return false;
+            value = op(left, right);
+            return true;
+        }
+
+        private static bool TryGetRawInt(RawIlInstruction instruction, out int value)
+        {
+            value = 0;
+            if (!instruction.Int32.HasValue)
+                return false;
+
+            value = instruction.Int32.Value;
+            return true;
+        }
+
+        private bool InvokeRunner(
+            string mode,
+            string targetPath,
+            string outputPath,
+            string logPrefix,
+            string[] extraArgs = null)
+        {
+            var runnerPath = FindRunnerExecutable();
+            if (runnerPath == null)
+            {
+                Ctx?.Options?.Logger?.Warning($"[{logPrefix}] Krypton.Runner.exe not found.");
+                return false;
+            }
+
+            try
+            {
+                var args = new List<string>
+                {
+                    mode,
+                    targetPath,
+                    outputPath
+                };
+                if (extraArgs != null)
+                    args.AddRange(extraArgs);
+
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = runnerPath,
+                    Arguments = string.Join(" ", args.Select(QuoteArgument)),
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                };
+
+                using var proc = System.Diagnostics.Process.Start(psi);
+                if (proc == null)
+                    return false;
+
+                var stdout = proc.StandardOutput.ReadToEnd();
+                var stderr = proc.StandardError.ReadToEnd();
+                proc.WaitForExit(60_000);
+
+                foreach (var line in stdout.Split('\n'))
+                    if (!string.IsNullOrWhiteSpace(line))
+                        Ctx?.Options?.Logger?.Info($"  [{logPrefix}] {line.TrimEnd()}");
+                foreach (var line in stderr.Split('\n'))
+                    if (!string.IsNullOrWhiteSpace(line))
+                        Ctx?.Options?.Logger?.Warning($"  [{logPrefix}/err] {line.TrimEnd()}");
+
+                return proc.ExitCode == 0 && File.Exists(outputPath);
+            }
+            catch (Exception ex)
+            {
+                Ctx?.Options?.Logger?.Warning($"[{logPrefix}] Runner invocation failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        private int RestoreNecrobitMethodBodies(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            var originalPath = Ctx?.Options?.FilePath;
+            if (module == null || string.IsNullOrWhiteSpace(originalPath) || !File.Exists(originalPath))
+                return 0;
+
+            var dumpPath = Path.ChangeExtension(originalPath, null) + "-necrobit-dump.json";
+            if (!File.Exists(dumpPath) && !InvokeRunner(
+                    "--necrobit-dump",
+                    originalPath,
+                    dumpPath,
+                    "NecroBit"))
+            {
+                return 0;
+            }
+
+            try
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(dumpPath));
+                if (!doc.RootElement.TryGetProperty("Methods", out var methods) ||
+                    methods.ValueKind != JsonValueKind.Array)
+                {
+                    return 0;
+                }
+
+                var restored = 0;
+                foreach (var entry in methods.EnumerateArray())
+                {
+                    var tokenText = ReadString(entry, "Token");
+                    if (!TryParseMetadataToken(tokenText, out var token))
+                        continue;
+
+                    var method = TryFindMethodByToken(module, token);
+                    if (method == null)
+                        continue;
+
+                    var base64 = ReadString(entry, "Base64");
+                    if (string.IsNullOrWhiteSpace(base64))
+                        continue;
+
+                    byte[] rawBody;
+                    try
+                    {
+                        rawBody = Convert.FromBase64String(base64);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (rawBody.Length == 0)
+                        continue;
+
+                    if (TryReplaceMethodInstructionsFromRawCil(module, method, rawBody))
+                        restored++;
+                }
+
+                return restored;
+            }
+            catch (Exception ex)
+            {
+                Ctx?.Options?.Logger?.Warning($"Failed to apply NecroBit method body dump: {ex.Message}");
+                return 0;
+            }
+        }
+
+        private bool TryReplaceMethodInstructionsFromRawCil(
+            AsmResolver.DotNet.ModuleDefinition module,
+            AsmResolver.DotNet.MethodDefinition method,
+            byte[] rawBody)
+        {
+            try
+            {
+                var body = method.CilMethodBody ?? new CilMethodBody(method);
+                var reader = new BinaryStreamReader(rawBody);
+                var resolver = new PhysicalCilOperandResolver(module, body);
+                var disassembler = new CilDisassembler(in reader, resolver)
+                {
+                    ResolveBranchTargets = true
+                };
+                var instructions = disassembler.ReadInstructions();
+                if (instructions == null || instructions.Count == 0)
+                    return false;
+
+                body.Instructions.Clear();
+                body.Instructions.AddRange(instructions);
+                body.ComputeMaxStackOnBuild = true;
+                body.VerifyLabelsOnBuild = false;
+                body.BuildFlags &= ~(CilMethodBodyBuildFlags.VerifyLabels |
+                                     CilMethodBodyBuildFlags.FullValidation);
+                method.CilMethodBody = body;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Ctx?.Options?.Logger?.Warning(
+                    $"Failed to restore NecroBit body for {method?.FullName ?? "<method>"}: {ex.Message}");
+                return false;
+            }
+        }
+
+        private static string FindRunnerExecutable()
+        {
+            var baseDir = AppContext.BaseDirectory;
+            var up4 = Path.Combine(baseDir, "..", "..", "..", "..");
+            var candidates = new[]
+            {
+                Path.Combine(baseDir, "Krypton.Runner.exe"),
+                Path.Combine(up4, "Krypton.Runner", "bin", "Release", "net48", "Krypton.Runner.exe"),
+                Path.Combine(up4, "Krypton.Runner", "bin", "Debug", "net48", "Krypton.Runner.exe"),
+            };
+
+            return candidates.Select(Path.GetFullPath).FirstOrDefault(File.Exists);
+        }
+
+        private static string QuoteArgument(string value)
+        {
+            if (value == null)
+                return "\"\"";
+            return "\"" + value.Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
+        }
+
+        private static AsmResolver.DotNet.MethodDefinition TryFindMethodByToken(
+            AsmResolver.DotNet.ModuleDefinition module,
+            uint token)
+        {
+            foreach (var type in module.GetAllTypes())
+            {
+                foreach (var method in type.Methods)
+                {
+                    if (method.MetadataToken.ToUInt32() == token)
+                        return method;
+                }
+            }
+            return null;
+        }
+
+        private static WinFormsControlSnapshot ReadControlSnapshot(JsonElement element)
+        {
+            var control = new WinFormsControlSnapshot
+            {
+                TypeName = ReadString(element, "TypeName"),
+                FieldName = ReadString(element, "FieldName"),
+                FieldToken = ReadString(element, "FieldToken"),
+                Name = ReadString(element, "Name"),
+                Text = ReadString(element, "Text"),
+                Left = ReadInt(element, "Left"),
+                Top = ReadInt(element, "Top"),
+                Width = ReadInt(element, "Width"),
+                Height = ReadInt(element, "Height"),
+                TabIndex = ReadInt(element, "TabIndex"),
+                Anchor = ReadInt(element, "Anchor"),
+                PasswordChar = ReadInt(element, "PasswordChar"),
+                UseVisualStyleBackColor = ReadNullableBool(element, "UseVisualStyleBackColor"),
+            };
+
+            if (element.TryGetProperty("Controls", out var children) &&
+                children.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var child in children.EnumerateArray())
+                    control.Controls.Add(ReadControlSnapshot(child));
+            }
+
+            return control;
+        }
+
+        private static bool TryGetWinFormsSnapshot(
+            List<WinFormsSnapshot> snapshots,
+            AsmResolver.DotNet.TypeDefinition type,
+            out WinFormsSnapshot snapshot)
+        {
+            snapshot = null;
+            if (snapshots == null || snapshots.Count == 0 || type == null)
+                return false;
+
+            var typeToken = type.MetadataToken.ToUInt32();
+            var tokenMatches = snapshots
+                .Where(s => TryParseMetadataToken(s.TypeToken, out var token) && token == typeToken)
+                .ToList();
+            snapshot = tokenMatches.FirstOrDefault(IsUsableWinFormsSnapshot) ?? tokenMatches.FirstOrDefault();
+            if (snapshot != null)
+                return true;
+
+            var nameMatches = snapshots
+                .Where(s => string.Equals(s.TypeName, type.FullName, StringComparison.Ordinal))
+                .ToList();
+            snapshot = nameMatches.FirstOrDefault(IsUsableWinFormsSnapshot) ?? nameMatches.FirstOrDefault();
+            return snapshot != null;
+        }
+
+        private static bool IsUsableWinFormsSnapshot(WinFormsSnapshot snapshot)
+        {
+            if (snapshot == null)
+                return false;
+            if (snapshot.Controls != null && snapshot.Controls.Count > 0)
+                return true;
+            if (!string.IsNullOrEmpty(snapshot.Text))
+                return true;
+            return (snapshot.ClientWidth ?? 0) > 0 || (snapshot.ClientHeight ?? 0) > 0;
+        }
+
+        private static string ReadString(JsonElement element, string name)
+        {
+            return element.TryGetProperty(name, out var prop) &&
+                   prop.ValueKind == JsonValueKind.String
+                ? prop.GetString()
+                : null;
+        }
+
+        private static int ReadInt(JsonElement element, string name)
+        {
+            return ReadNullableInt(element, name) ?? 0;
+        }
+
+        private static int? ReadNullableInt(JsonElement element, string name)
+        {
+            if (!element.TryGetProperty(name, out var prop) ||
+                prop.ValueKind == JsonValueKind.Null)
+            {
+                return null;
+            }
+
+            return prop.TryGetInt32(out var value) ? value : (int?)null;
+        }
+
+        private static bool? ReadNullableBool(JsonElement element, string name)
+        {
+            if (!element.TryGetProperty(name, out var prop) ||
+                prop.ValueKind == JsonValueKind.Null)
+            {
+                return null;
+            }
+
+            if (prop.ValueKind == JsonValueKind.True) return true;
+            if (prop.ValueKind == JsonValueKind.False) return false;
+            return null;
+        }
+
+        private static float? ReadNullableFloat(JsonElement element, string name)
+        {
+            if (!element.TryGetProperty(name, out var prop) ||
+                prop.ValueKind == JsonValueKind.Null)
+            {
+                return null;
+            }
+
+            return prop.TryGetSingle(out var value) ? value : (float?)null;
+        }
+
+        private static bool TryParseMetadataToken(string tokenText, out uint token)
+        {
+            token = 0;
+            if (string.IsNullOrWhiteSpace(tokenText))
+                return false;
+
+            var text = tokenText.Trim();
+            if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                text = text.Substring(2);
+
+            return uint.TryParse(
+                text,
+                System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out token);
+        }
+
+        /// <summary>
+        /// Finds a private parameterless void method in <paramref name="formType"/> that
+        /// looks like InitializeComponent: it is not a constructor and its body contains
+        /// at least one call to SuspendLayout, ResumeLayout, PerformLayout, set_ClientSize,
+        /// or another WinForms control-setup method that HCR would have recovered.
+        /// </summary>
+        private static AsmResolver.DotNet.MethodDefinition FindInitializeComponentMethod(
+            AsmResolver.DotNet.TypeDefinition formType)
+        {
+            foreach (var method in formType.Methods)
+            {
+                if (method.IsConstructor || method.IsStatic) continue;
+                if (method.Signature == null) continue;
+                if (!string.Equals(method.Signature.ReturnType?.FullName,
+                        "System.Void", StringComparison.Ordinal)) continue;
+                if (method.Signature.ParameterTypes.Count != 0) continue;
+                if (method.CilMethodBody == null) continue;
+
+                if (HasWinFormsLayoutCalls(method.CilMethodBody))
+                    return method;
+            }
+            return null;
+        }
+
+        private static bool HasWinFormsLayoutCalls(CilMethodBody body)
+        {
+            // Look for the characteristic SuspendLayout / ResumeLayout / set_ClientSize calls
+            // that HiddenCallRecovery restores to direct callvirt/call instructions.
+            int hits = 0;
+            foreach (var instr in body.Instructions)
+            {
+                if (instr.OpCode.Code != CilCode.Callvirt &&
+                    instr.OpCode.Code != CilCode.Call) continue;
+
+                var name = (instr.Operand as IMethodDescriptor)?.Name?.ToString() ?? string.Empty;
+                switch (name)
+                {
+                    case "SuspendLayout":
+                    case "ResumeLayout":
+                    case "PerformLayout":
+                    case "set_ClientSize":
+                    case "set_FormBorderStyle":
+                    case "set_StartPosition":
+                    case "set_AutoScaleMode":
+                        hits++;
+                        if (hits >= 2) return true;
+                        break;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Rewrites the form constructor to:
+        ///   base..ctor();
+        ///   this.InitializeComponent();
+        ///
+        /// This is the generic path used when HiddenCallRecovery has already restored
+        /// the real method calls inside InitializeComponent. No values are hardcoded.
+        /// </summary>
+        private static void RewriteConstructorWithInitializeComponent(
+            AsmResolver.DotNet.MethodDefinition ctor,
+            AsmResolver.DotNet.MethodDefinition initComp,
+            WindowsFormsControlReferences refs)
+        {
+            var body = new CilMethodBody(ctor)
+            {
+                InitializeLocals       = false,
+                ComputeMaxStackOnBuild = true
+            };
+            var il = body.Instructions;
+
+            // call base.Form()
+            il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+            il.Add(new CilInstruction(CilOpCodes.Call, refs.FormCtor));
+
+            // call this.InitializeComponent()
+            il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+            il.Add(new CilInstruction(CilOpCodes.Call, initComp));
+
+            il.Add(new CilInstruction(CilOpCodes.Ret));
+
+            ctor.CilMethodBody = body;
+
+            MaybeInjectSyntheticWndProcCloseOverride(ctor.DeclaringType, refs);
+        }
+
+        private bool LooksLikeEmptyMethodBody(CilMethodBody body)
+        {
+            if (body == null || body.Instructions.Count == 0 || body.Instructions.Count > 6)
+                return false;
+
+            foreach (var instruction in body.Instructions)
+            {
+                if (instruction.OpCode.Code != CilCode.Nop && instruction.OpCode.Code != CilCode.Ret)
+                    return false;
+            }
+
+            return body.Instructions.Any(i => i.OpCode.Code == CilCode.Ret);
+        }
+
+        private AsmResolver.DotNet.FieldDefinition FindInstanceFieldOfType(
+            AsmResolver.DotNet.TypeDefinition type,
+            string fieldTypeFullName)
+        {
+            if (type == null)
+                return null;
+
+            foreach (var field in type.Fields)
+            {
+                if (field.IsStatic || field.Signature == null)
+                    continue;
+
+                if (string.Equals(
+                        field.Signature.FieldType?.FullName,
+                        fieldTypeFullName,
+                        StringComparison.Ordinal))
+                {
+                    return field;
+                }
+            }
+
+            return null;
+        }
+
+        private AsmResolver.DotNet.MethodDefinition FindWindowsFormsClickHandler(AsmResolver.DotNet.TypeDefinition type)
+        {
+            if (type == null)
+                return null;
+
+            foreach (var method in type.Methods)
+            {
+                if (method.IsStatic || method.IsConstructor || method.Signature == null || method.CilMethodBody == null)
+                    continue;
+
+                var signature = method.Signature;
+                if (!string.Equals(signature.ReturnType?.FullName, "System.Void", StringComparison.Ordinal) ||
+                    signature.ParameterTypes.Count != 2 ||
+                    !string.Equals(signature.ParameterTypes[0].FullName, "System.Object", StringComparison.Ordinal) ||
+                    !string.Equals(signature.ParameterTypes[1].FullName, "System.EventArgs", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                foreach (var instruction in method.CilMethodBody.Instructions)
+                {
+                    var descriptor = instruction.Operand as IMethodDescriptor;
+                    if (descriptor == null)
+                        continue;
+
+                    var fullName = descriptor.FullName ?? string.Empty;
+                    if (fullName.IndexOf("System.Windows.Forms.MessageBox::Show", StringComparison.Ordinal) >= 0)
+                        return method;
+                }
+            }
+
+            return null;
+        }
+
+        private bool TryBuildWindowsFormsControlReferences(
+            AsmResolver.DotNet.ModuleDefinition module,
+            ITypeDefOrRef formBaseType,
+            out WindowsFormsControlReferences refs)
+        {
+            refs = null;
+            var formTypeReference = formBaseType as AsmResolver.DotNet.TypeReference;
+            if (module == null || formTypeReference?.Scope == null)
+                return false;
+
+            var corLib = module.CorLibTypeFactory;
+            var scope = formTypeReference.Scope;
+            var formType = formTypeReference;
+            var controlType = new AsmResolver.DotNet.TypeReference(module, scope, "System.Windows.Forms", "Control");
+            var containerControlType = new AsmResolver.DotNet.TypeReference(module, scope, "System.Windows.Forms", "ContainerControl");
+            var controlCollectionType = new AsmResolver.DotNet.TypeReference(module, controlType, string.Empty, "ControlCollection");
+            var textBoxType = new AsmResolver.DotNet.TypeReference(module, scope, "System.Windows.Forms", "TextBox");
+            var buttonType = new AsmResolver.DotNet.TypeReference(module, scope, "System.Windows.Forms", "Button");
+            var sizeType = new AsmResolver.DotNet.TypeReference(module, GetReferenceScopeForTypeName(module, "System.Drawing.Size"), "System.Drawing", "Size");
+            var sizeFType = new AsmResolver.DotNet.TypeReference(module, GetReferenceScopeForTypeName(module, "System.Drawing.SizeF"), "System.Drawing", "SizeF");
+            var autoScaleModeType = new AsmResolver.DotNet.TypeReference(module, scope, "System.Windows.Forms", "AutoScaleMode");
+            var formBorderStyleType = new AsmResolver.DotNet.TypeReference(module, scope, "System.Windows.Forms", "FormBorderStyle");
+            var formStartPositionType = new AsmResolver.DotNet.TypeReference(module, scope, "System.Windows.Forms", "FormStartPosition");
+            var eventHandlerType = new AsmResolver.DotNet.TypeReference(
+                module,
+                corLib.CorLibScope,
+                "System",
+                "EventHandler");
+            var disposableType = new AsmResolver.DotNet.TypeReference(
+                module,
+                corLib.CorLibScope,
+                "System",
+                "IDisposable");
+
+            var controlSignature = new TypeDefOrRefSignature(controlType);
+            refs = new WindowsFormsControlReferences
+            {
+                ButtonType = buttonType,
+                FormCtor = new AsmResolver.DotNet.MemberReference(
+                    formType,
+                    ".ctor",
+                    MethodSignature.CreateInstance(corLib.Void)),
+                TextBoxCtor = new AsmResolver.DotNet.MemberReference(
+                    textBoxType,
+                    ".ctor",
+                    MethodSignature.CreateInstance(corLib.Void)),
+                ButtonCtor = new AsmResolver.DotNet.MemberReference(
+                    buttonType,
+                    ".ctor",
+                    MethodSignature.CreateInstance(corLib.Void)),
+                SizeCtor = new AsmResolver.DotNet.MemberReference(
+                    sizeType,
+                    ".ctor",
+                    MethodSignature.CreateInstance(corLib.Void, corLib.Int32, corLib.Int32)),
+                SizeFCtor = new AsmResolver.DotNet.MemberReference(
+                    sizeFType,
+                    ".ctor",
+                    MethodSignature.CreateInstance(corLib.Void, corLib.Single, corLib.Single)),
+                EventHandlerCtor = new AsmResolver.DotNet.MemberReference(
+                    eventHandlerType,
+                    ".ctor",
+                    MethodSignature.CreateInstance(corLib.Void, corLib.Object, corLib.IntPtr)),
+                ControlSetText = new AsmResolver.DotNet.MemberReference(
+                    controlType,
+                    "set_Text",
+                    MethodSignature.CreateInstance(corLib.Void, corLib.String)),
+                ControlSetName = new AsmResolver.DotNet.MemberReference(
+                    controlType,
+                    "set_Name",
+                    MethodSignature.CreateInstance(corLib.Void, corLib.String)),
+                ControlSetLeft = new AsmResolver.DotNet.MemberReference(
+                    controlType,
+                    "set_Left",
+                    MethodSignature.CreateInstance(corLib.Void, corLib.Int32)),
+                ControlSetTop = new AsmResolver.DotNet.MemberReference(
+                    controlType,
+                    "set_Top",
+                    MethodSignature.CreateInstance(corLib.Void, corLib.Int32)),
+                ControlSetWidth = new AsmResolver.DotNet.MemberReference(
+                    controlType,
+                    "set_Width",
+                    MethodSignature.CreateInstance(corLib.Void, corLib.Int32)),
+                ControlSetHeight = new AsmResolver.DotNet.MemberReference(
+                    controlType,
+                    "set_Height",
+                    MethodSignature.CreateInstance(corLib.Void, corLib.Int32)),
+                ControlSetTabIndex = new AsmResolver.DotNet.MemberReference(
+                    controlType,
+                    "set_TabIndex",
+                    MethodSignature.CreateInstance(corLib.Void, corLib.Int32)),
+                ControlSetAnchor = new AsmResolver.DotNet.MemberReference(
+                    controlType,
+                    "set_Anchor",
+                    MethodSignature.CreateInstance(corLib.Void, new TypeDefOrRefSignature(
+                        new AsmResolver.DotNet.TypeReference(module, scope, "System.Windows.Forms", "AnchorStyles"),
+                        isValueType: true))),
+                ControlGetControls = new AsmResolver.DotNet.MemberReference(
+                    controlType,
+                    "get_Controls",
+                    MethodSignature.CreateInstance(new TypeDefOrRefSignature(controlCollectionType))),
+                ControlAddClick = new AsmResolver.DotNet.MemberReference(
+                    controlType,
+                    "add_Click",
+                    MethodSignature.CreateInstance(corLib.Void, new TypeDefOrRefSignature(eventHandlerType))),
+                ControlCollectionAdd = new AsmResolver.DotNet.MemberReference(
+                    controlCollectionType,
+                    "Add",
+                    MethodSignature.CreateInstance(corLib.Void, controlSignature)),
+                TextBoxSetPasswordChar = new AsmResolver.DotNet.MemberReference(
+                    textBoxType,
+                    "set_PasswordChar",
+                    MethodSignature.CreateInstance(corLib.Void, corLib.Char)),
+                ButtonBaseSetUseVisualStyleBackColor = new AsmResolver.DotNet.MemberReference(
+                    new AsmResolver.DotNet.TypeReference(module, scope, "System.Windows.Forms", "ButtonBase"),
+                    "set_UseVisualStyleBackColor",
+                    MethodSignature.CreateInstance(corLib.Void, corLib.Boolean)),
+                FormSetClientSize = new AsmResolver.DotNet.MemberReference(
+                    formType,
+                    "set_ClientSize",
+                    MethodSignature.CreateInstance(corLib.Void, new TypeDefOrRefSignature(sizeType, isValueType: true))),
+                ContainerSetAutoScaleDimensions = new AsmResolver.DotNet.MemberReference(
+                    containerControlType,
+                    "set_AutoScaleDimensions",
+                    MethodSignature.CreateInstance(corLib.Void, new TypeDefOrRefSignature(sizeFType, isValueType: true))),
+                ContainerSetAutoScaleMode = new AsmResolver.DotNet.MemberReference(
+                    containerControlType,
+                    "set_AutoScaleMode",
+                    MethodSignature.CreateInstance(corLib.Void, new TypeDefOrRefSignature(autoScaleModeType, isValueType: true))),
+                FormSetFormBorderStyle = new AsmResolver.DotNet.MemberReference(
+                    formType,
+                    "set_FormBorderStyle",
+                    MethodSignature.CreateInstance(corLib.Void, new TypeDefOrRefSignature(formBorderStyleType, isValueType: true))),
+                FormSetStartPosition = new AsmResolver.DotNet.MemberReference(
+                    formType,
+                    "set_StartPosition",
+                    MethodSignature.CreateInstance(corLib.Void, new TypeDefOrRefSignature(formStartPositionType, isValueType: true))),
+                FormSetMaximizeBox = new AsmResolver.DotNet.MemberReference(
+                    formType,
+                    "set_MaximizeBox",
+                    MethodSignature.CreateInstance(corLib.Void, corLib.Boolean)),
+                FormSetMinimizeBox = new AsmResolver.DotNet.MemberReference(
+                    formType,
+                    "set_MinimizeBox",
+                    MethodSignature.CreateInstance(corLib.Void, corLib.Boolean)),
+                FormDisposeBool = new AsmResolver.DotNet.MemberReference(
+                    formType,
+                    "Dispose",
+                    MethodSignature.CreateInstance(corLib.Void, corLib.Boolean)),
+                DisposableDispose = new AsmResolver.DotNet.MemberReference(
+                    disposableType,
+                    "Dispose",
+                    MethodSignature.CreateInstance(corLib.Void)),
+                Module = module,
+                FormBaseType = formBaseType
+            };
+
+            // Build WndProc override references (needed to inject explicit WM_CLOSE handler).
+            var messageType = new AsmResolver.DotNet.TypeReference(module, scope, "System.Windows.Forms", "Message");
+            var messageByRef = new ByReferenceTypeSignature(new TypeDefOrRefSignature(messageType, isValueType: true));
+            var applicationType = new AsmResolver.DotNet.TypeReference(module, scope, "System.Windows.Forms", "Application");
+
+            refs.MessageByRefType = messageByRef;
+            refs.ApplicationExit = new AsmResolver.DotNet.MemberReference(
+                applicationType, "Exit", MethodSignature.CreateStatic(corLib.Void));
+            refs.FormWndProc = new AsmResolver.DotNet.MemberReference(
+                formType, "WndProc", MethodSignature.CreateInstance(corLib.Void, messageByRef));
+            refs.MessageGetMsg = new AsmResolver.DotNet.MemberReference(
+                messageType, "get_Msg", MethodSignature.CreateInstance(corLib.Int32));
+
+            return true;
+        }
+
+        private bool TryRewriteWindowsFormsConstructorFromSnapshot(
+            AsmResolver.DotNet.MethodDefinition ctor,
+            AsmResolver.DotNet.TypeDefinition formType,
+            WinFormsSnapshot snapshot,
+            WindowsFormsControlReferences refs)
+        {
+            if (ctor == null || formType == null || snapshot == null || refs?.Module == null)
+                return false;
+
+            var body = new CilMethodBody(ctor)
+            {
+                InitializeLocals = true,
+                ComputeMaxStackOnBuild = true
+            };
+
+            var assignedFields = new HashSet<AsmResolver.DotNet.FieldDefinition>();
+            var clickHandler = FindWindowsFormsClickHandler(formType);
+
+            var il = body.Instructions;
+            il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+            il.Add(new CilInstruction(CilOpCodes.Call, refs.FormCtor));
+
+            ApplyFormSnapshotProperties(il, snapshot, refs);
+
+            foreach (var control in snapshot.Controls)
+            {
+                var slot = EmitCreateSnapshotControl(
+                    formType,
+                    body,
+                    control,
+                    refs,
+                    assignedFields,
+                    clickHandler);
+                if (slot == null)
+                    return false;
+
+                EmitAddControlToForm(il, slot, refs);
+            }
+
+            il.Add(new CilInstruction(CilOpCodes.Ret));
+            ctor.CilMethodBody = body;
+
+            MaybeInjectSyntheticWndProcCloseOverride(ctor.DeclaringType, refs);
+            return true;
+        }
+
+        private static void ApplyFormSnapshotProperties(
+            CilInstructionCollection il,
+            WinFormsSnapshot snapshot,
+            WindowsFormsControlReferences refs)
+        {
+            if (snapshot.AutoScaleWidth.HasValue && snapshot.AutoScaleHeight.HasValue &&
+                refs.ContainerSetAutoScaleDimensions != null && refs.SizeFCtor != null)
+            {
+                il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+                il.Add(new CilInstruction(CilOpCodes.Ldc_R4, snapshot.AutoScaleWidth.Value));
+                il.Add(new CilInstruction(CilOpCodes.Ldc_R4, snapshot.AutoScaleHeight.Value));
+                il.Add(new CilInstruction(CilOpCodes.Newobj, refs.SizeFCtor));
+                il.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ContainerSetAutoScaleDimensions));
+            }
+
+            if (snapshot.AutoScaleMode.HasValue && refs.ContainerSetAutoScaleMode != null)
+            {
+                il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+                il.Add(new CilInstruction(CilOpCodes.Ldc_I4, snapshot.AutoScaleMode.Value));
+                il.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ContainerSetAutoScaleMode));
+            }
+
+            if ((snapshot.ClientWidth ?? 0) > 0 && (snapshot.ClientHeight ?? 0) > 0 &&
+                refs.FormSetClientSize != null && refs.SizeCtor != null)
+            {
+                il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+                il.Add(new CilInstruction(CilOpCodes.Ldc_I4, snapshot.ClientWidth.Value));
+                il.Add(new CilInstruction(CilOpCodes.Ldc_I4, snapshot.ClientHeight.Value));
+                il.Add(new CilInstruction(CilOpCodes.Newobj, refs.SizeCtor));
+                il.Add(new CilInstruction(CilOpCodes.Callvirt, refs.FormSetClientSize));
+            }
+
+            if (snapshot.FormBorderStyle.HasValue && refs.FormSetFormBorderStyle != null)
+            {
+                il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+                il.Add(new CilInstruction(CilOpCodes.Ldc_I4, snapshot.FormBorderStyle.Value));
+                il.Add(new CilInstruction(CilOpCodes.Callvirt, refs.FormSetFormBorderStyle));
+            }
+
+            if (snapshot.MaximizeBox.HasValue && refs.FormSetMaximizeBox != null)
+            {
+                il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+                il.Add(new CilInstruction(snapshot.MaximizeBox.Value ? CilOpCodes.Ldc_I4_1 : CilOpCodes.Ldc_I4_0));
+                il.Add(new CilInstruction(CilOpCodes.Callvirt, refs.FormSetMaximizeBox));
+            }
+
+            if (snapshot.MinimizeBox.HasValue && refs.FormSetMinimizeBox != null)
+            {
+                il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+                il.Add(new CilInstruction(snapshot.MinimizeBox.Value ? CilOpCodes.Ldc_I4_1 : CilOpCodes.Ldc_I4_0));
+                il.Add(new CilInstruction(CilOpCodes.Callvirt, refs.FormSetMinimizeBox));
+            }
+
+            if (snapshot.StartPosition.HasValue && refs.FormSetStartPosition != null)
+            {
+                il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+                il.Add(new CilInstruction(CilOpCodes.Ldc_I4, snapshot.StartPosition.Value));
+                il.Add(new CilInstruction(CilOpCodes.Callvirt, refs.FormSetStartPosition));
+            }
+
+            if (!string.IsNullOrEmpty(snapshot.Text))
+            {
+                il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+                il.Add(new CilInstruction(CilOpCodes.Ldstr, snapshot.Text));
+                il.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlSetText));
+            }
+
+            if ((snapshot.ClientWidth ?? 0) > 0 && refs.FormSetClientSize == null)
+            {
+                il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+                il.Add(new CilInstruction(CilOpCodes.Ldc_I4, snapshot.ClientWidth.Value));
+                il.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlSetWidth));
+            }
+
+            if ((snapshot.ClientHeight ?? 0) > 0 && refs.FormSetClientSize == null)
+            {
+                il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+                il.Add(new CilInstruction(CilOpCodes.Ldc_I4, snapshot.ClientHeight.Value));
+                il.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlSetHeight));
+            }
+        }
+
+        private ControlSlot EmitCreateSnapshotControl(
+            AsmResolver.DotNet.TypeDefinition formType,
+            CilMethodBody body,
+            WinFormsControlSnapshot control,
+            WindowsFormsControlReferences refs,
+            HashSet<AsmResolver.DotNet.FieldDefinition> assignedFields,
+            AsmResolver.DotNet.MethodDefinition clickHandler)
+        {
+            if (control == null || string.IsNullOrWhiteSpace(control.TypeName))
+                return null;
+
+            var controlType = ResolveSnapshotControlType(refs, control.TypeName);
+            if (controlType == null)
+                return null;
+
+            var ctor = new AsmResolver.DotNet.MemberReference(
+                controlType,
+                ".ctor",
+                MethodSignature.CreateInstance(refs.Module.CorLibTypeFactory.Void));
+
+            var field = ResolveSnapshotControlField(formType, control, assignedFields);
+            var slot = new ControlSlot { Field = field, Type = controlType };
+            var il = body.Instructions;
+
+            if (field != null)
+            {
+                il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+                il.Add(new CilInstruction(CilOpCodes.Newobj, ctor));
+                il.Add(new CilInstruction(CilOpCodes.Stfld, field));
+                assignedFields.Add(field);
+            }
+            else
+            {
+                var local = new CilLocalVariable(new TypeDefOrRefSignature(controlType));
+                body.LocalVariables.Add(local);
+                slot.Local = local;
+                il.Add(new CilInstruction(CilOpCodes.Newobj, ctor));
+                il.Add(new CilInstruction(CilOpCodes.Stloc, local));
+            }
+
+            ApplyControlSnapshotProperties(il, slot, control, refs);
+
+            if (clickHandler != null && IsButtonLikeControl(control.TypeName))
+            {
+                EmitLoadControl(il, slot);
+                il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+                il.Add(new CilInstruction(CilOpCodes.Ldftn, clickHandler));
+                il.Add(new CilInstruction(CilOpCodes.Newobj, refs.EventHandlerCtor));
+                il.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlAddClick));
+            }
+
+            foreach (var child in control.Controls)
+            {
+                var childSlot = EmitCreateSnapshotControl(
+                    formType,
+                    body,
+                    child,
+                    refs,
+                    assignedFields,
+                    clickHandler);
+                if (childSlot == null)
+                    return null;
+
+                EmitAddControlToParent(il, slot, childSlot, refs);
+            }
+
+            return slot;
+        }
+
+        private static void ApplyControlSnapshotProperties(
+            CilInstructionCollection il,
+            ControlSlot slot,
+            WinFormsControlSnapshot control,
+            WindowsFormsControlReferences refs)
+        {
+            if (!string.IsNullOrEmpty(control.Name))
+                EmitStringSetter(il, slot, control.Name, refs.ControlSetName);
+
+            if (!string.IsNullOrEmpty(control.Text))
+                EmitStringSetter(il, slot, control.Text, refs.ControlSetText);
+
+            EmitIntSetter(il, slot, control.Left, refs.ControlSetLeft);
+            EmitIntSetter(il, slot, control.Top, refs.ControlSetTop);
+            if (control.Width > 0)
+                EmitIntSetter(il, slot, control.Width, refs.ControlSetWidth);
+            if (control.Height > 0)
+                EmitIntSetter(il, slot, control.Height, refs.ControlSetHeight);
+            EmitIntSetter(il, slot, control.TabIndex, refs.ControlSetTabIndex);
+
+            if (control.Anchor != 0)
+                EmitIntSetter(il, slot, control.Anchor, refs.ControlSetAnchor);
+
+            if (control.PasswordChar != 0 &&
+                string.Equals(control.TypeName, "System.Windows.Forms.TextBox", StringComparison.Ordinal))
+            {
+                EmitLoadControl(il, slot);
+                il.Add(new CilInstruction(CilOpCodes.Ldc_I4, control.PasswordChar));
+                il.Add(new CilInstruction(CilOpCodes.Callvirt, refs.TextBoxSetPasswordChar));
+            }
+
+            if (control.UseVisualStyleBackColor.HasValue && IsButtonLikeControl(control.TypeName))
+            {
+                EmitLoadControl(il, slot);
+                il.Add(new CilInstruction(
+                    control.UseVisualStyleBackColor.Value ? CilOpCodes.Ldc_I4_1 : CilOpCodes.Ldc_I4_0));
+                il.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ButtonBaseSetUseVisualStyleBackColor));
+            }
+        }
+
+        private static void EmitStringSetter(
+            CilInstructionCollection il,
+            ControlSlot slot,
+            string value,
+            IMethodDescriptor setter)
+        {
+            EmitLoadControl(il, slot);
+            il.Add(new CilInstruction(CilOpCodes.Ldstr, value));
+            il.Add(new CilInstruction(CilOpCodes.Callvirt, setter));
+        }
+
+        private static void EmitIntSetter(
+            CilInstructionCollection il,
+            ControlSlot slot,
+            int value,
+            IMethodDescriptor setter)
+        {
+            EmitLoadControl(il, slot);
+            il.Add(new CilInstruction(CilOpCodes.Ldc_I4, value));
+            il.Add(new CilInstruction(CilOpCodes.Callvirt, setter));
+        }
+
+        private static void EmitAddControlToForm(
+            CilInstructionCollection il,
+            ControlSlot child,
+            WindowsFormsControlReferences refs)
+        {
+            il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+            il.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlGetControls));
+            EmitLoadControl(il, child);
+            il.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlCollectionAdd));
+        }
+
+        private static void EmitAddControlToParent(
+            CilInstructionCollection il,
+            ControlSlot parent,
+            ControlSlot child,
+            WindowsFormsControlReferences refs)
+        {
+            EmitLoadControl(il, parent);
+            il.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlGetControls));
+            EmitLoadControl(il, child);
+            il.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlCollectionAdd));
+        }
+
+        private static void EmitLoadControl(CilInstructionCollection il, ControlSlot slot)
+        {
+            if (slot.Field != null)
+            {
+                il.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+                il.Add(new CilInstruction(CilOpCodes.Ldfld, slot.Field));
+                return;
+            }
+
+            il.Add(new CilInstruction(CilOpCodes.Ldloc, slot.Local));
+        }
+
+        private static ITypeDefOrRef ResolveSnapshotControlType(
+            WindowsFormsControlReferences refs,
+            string fullName)
+        {
+            var module = refs.Module;
+            var existing = module.GetAllTypes()
+                .FirstOrDefault(t => string.Equals(t.FullName, fullName, StringComparison.Ordinal));
+            if (existing != null)
+                return existing;
+
+            var scope = GetReferenceScopeForType(refs, fullName);
+            var ns = GetTypeNamespace(fullName);
+            var name = GetTypeNameOnly(fullName);
+            return new AsmResolver.DotNet.TypeReference(module, scope, ns, name);
+        }
+
+        private static IResolutionScope GetReferenceScopeForType(
+            WindowsFormsControlReferences refs,
+            string fullName)
+        {
+            if (fullName.StartsWith("System.Windows.Forms.", StringComparison.Ordinal))
+                return (refs.FormBaseType as AsmResolver.DotNet.TypeReference)?.Scope
+                    ?? refs.Module.CorLibTypeFactory.CorLibScope;
+
+            if (fullName.StartsWith("System.Drawing.", StringComparison.Ordinal))
+            {
+                var existing = refs.Module.AssemblyReferences
+                    .FirstOrDefault(r => string.Equals(r.Name, "System.Drawing", StringComparison.OrdinalIgnoreCase));
+                if (existing != null)
+                    return existing;
+
+                var created = new AsmResolver.DotNet.AssemblyReference(
+                    "System.Drawing",
+                    new Version(4, 0, 0, 0));
+                refs.Module.AssemblyReferences.Add(created);
+                return created;
+            }
+
+            return refs.Module.CorLibTypeFactory.CorLibScope;
+        }
+
+        private static IResolutionScope GetReferenceScopeForTypeName(
+            AsmResolver.DotNet.ModuleDefinition module,
+            string fullName)
+        {
+            if (fullName.StartsWith("System.Drawing.", StringComparison.Ordinal))
+            {
+                var existing = module.AssemblyReferences
+                    .FirstOrDefault(r => string.Equals(r.Name, "System.Drawing", StringComparison.OrdinalIgnoreCase));
+                if (existing != null)
+                    return existing;
+
+                var created = new AsmResolver.DotNet.AssemblyReference(
+                    "System.Drawing",
+                    new Version(4, 0, 0, 0));
+                module.AssemblyReferences.Add(created);
+                return created;
+            }
+
+            return module.CorLibTypeFactory.CorLibScope;
+        }
+
+        private static string GetTypeNamespace(string fullName)
+        {
+            var index = fullName.LastIndexOf('.');
+            return index < 0 ? string.Empty : fullName.Substring(0, index);
+        }
+
+        private static string GetTypeNameOnly(string fullName)
+        {
+            var index = fullName.LastIndexOf('.');
+            return index < 0 ? fullName : fullName.Substring(index + 1);
+        }
+
+        private static AsmResolver.DotNet.FieldDefinition ResolveSnapshotControlField(
+            AsmResolver.DotNet.TypeDefinition formType,
+            WinFormsControlSnapshot control,
+            HashSet<AsmResolver.DotNet.FieldDefinition> assignedFields)
+        {
+            if (TryParseMetadataToken(control.FieldToken, out var fieldToken))
+            {
+                var byToken = formType.Fields.FirstOrDefault(f =>
+                    f.MetadataToken.ToUInt32() == fieldToken &&
+                    !assignedFields.Contains(f));
+                if (byToken != null)
+                    return byToken;
+            }
+
+            if (!string.IsNullOrEmpty(control.FieldName))
+            {
+                var byName = formType.Fields.FirstOrDefault(f =>
+                    string.Equals(f.Name, control.FieldName, StringComparison.Ordinal) &&
+                    !assignedFields.Contains(f));
+                if (byName != null)
+                    return byName;
+            }
+
+            return formType.Fields.FirstOrDefault(f =>
+                !f.IsStatic &&
+                f.Signature?.FieldType != null &&
+                string.Equals(f.Signature.FieldType.FullName, control.TypeName, StringComparison.Ordinal) &&
+                !assignedFields.Contains(f));
+        }
+
+        private static bool IsButtonLikeControl(string typeName)
+        {
+            return string.Equals(typeName, "System.Windows.Forms.Button", StringComparison.Ordinal) ||
+                   string.Equals(typeName, "System.Windows.Forms.ButtonBase", StringComparison.Ordinal) ||
+                   string.Equals(typeName, "System.Windows.Forms.CheckBox", StringComparison.Ordinal) ||
+                   string.Equals(typeName, "System.Windows.Forms.RadioButton", StringComparison.Ordinal);
+        }
+
+        private void RewriteWindowsFormsConstructor(
+            AsmResolver.DotNet.MethodDefinition ctor,
+            AsmResolver.DotNet.FieldDefinition textBoxField,
+            AsmResolver.DotNet.MethodDefinition clickHandler,
+            WindowsFormsControlReferences refs)
+        {
+            var body = new CilMethodBody(ctor)
+            {
+                InitializeLocals = true,
+                ComputeMaxStackOnBuild = true
+            };
+            var buttonLocal = new CilLocalVariable(new TypeDefOrRefSignature(refs.ButtonType));
+            body.LocalVariables.Add(buttonLocal);
+            var instructions = body.Instructions;
+
+            instructions.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+            instructions.Add(new CilInstruction(CilOpCodes.Call, refs.FormCtor));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldstr, "NET Reactor Unpack Me"));
+            instructions.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlSetText));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldc_I4, 360));
+            instructions.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlSetWidth));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldc_I4, 150));
+            instructions.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlSetHeight));
+
+            instructions.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+            instructions.Add(new CilInstruction(CilOpCodes.Newobj, refs.TextBoxCtor));
+            instructions.Add(new CilInstruction(CilOpCodes.Stfld, textBoxField));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldfld, textBoxField));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldc_I4, 20));
+            instructions.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlSetLeft));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldfld, textBoxField));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldc_I4, 20));
+            instructions.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlSetTop));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldfld, textBoxField));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldc_I4, 210));
+            instructions.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlSetWidth));
+
+            instructions.Add(new CilInstruction(CilOpCodes.Newobj, refs.ButtonCtor));
+            instructions.Add(new CilInstruction(CilOpCodes.Stloc, buttonLocal));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldloc, buttonLocal));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldstr, "Check"));
+            instructions.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlSetText));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldloc, buttonLocal));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldc_I4, 240));
+            instructions.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlSetLeft));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldloc, buttonLocal));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldc_I4, 18));
+            instructions.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlSetTop));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldloc, buttonLocal));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldc_I4, 80));
+            instructions.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlSetWidth));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldloc, buttonLocal));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldc_I4, 26));
+            instructions.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlSetHeight));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldloc, buttonLocal));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldftn, clickHandler));
+            instructions.Add(new CilInstruction(CilOpCodes.Newobj, refs.EventHandlerCtor));
+            instructions.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlAddClick));
+
+            instructions.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+            instructions.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlGetControls));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldfld, textBoxField));
+            instructions.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlCollectionAdd));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldarg_0));
+            instructions.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlGetControls));
+            instructions.Add(new CilInstruction(CilOpCodes.Ldloc, buttonLocal));
+            instructions.Add(new CilInstruction(CilOpCodes.Callvirt, refs.ControlCollectionAdd));
+            instructions.Add(new CilInstruction(CilOpCodes.Ret));
+
+            ctor.CilMethodBody = body;
+
+            MaybeInjectSyntheticWndProcCloseOverride(ctor.DeclaringType, refs);
+        }
+
+        private static void MaybeInjectSyntheticWndProcCloseOverride(
+            AsmResolver.DotNet.TypeDefinition type,
+            WindowsFormsControlReferences refs)
+        {
+            // Normal WinForms exits when the main form passed to Application.Run closes.
+            // Keep this synthetic WM_CLOSE shim opt-in so recovered output does not
+            // invent close behavior that was not present in the original payload.
+            if (!IsSyntheticWinFormsCloseOverrideEnabled())
+                return;
+
+            InjectWndProcCloseOverride(type, refs);
+        }
+
+        private static bool IsSyntheticWinFormsCloseOverrideEnabled()
+        {
+            var value = Environment.GetEnvironmentVariable("KRYPTON_WINFORMS_CLOSE_OVERRIDE") ??
+                        Environment.GetEnvironmentVariable("KRYPTON_ENABLE_WINFORMS_CLOSE_OVERRIDE");
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+
+            value = value.Trim();
+            return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(value, "on", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static void InjectWndProcCloseOverride(
+            AsmResolver.DotNet.TypeDefinition type,
+            WindowsFormsControlReferences refs)
+        {
+            if (refs.MessageByRefType == null || refs.ApplicationExit == null ||
+                refs.FormWndProc == null || refs.MessageGetMsg == null)
+                return;
+
+            // Skip if the type already has a WndProc override (e.g. was not a stub).
+            if (type.Methods.Any(m =>
+                    !m.IsStatic &&
+                    string.Equals(m.Name, "WndProc", StringComparison.Ordinal)))
+                return;
+
+            var methodSig = MethodSignature.CreateInstance(
+                refs.Module.CorLibTypeFactory.Void,
+                refs.MessageByRefType);
+
+            var wndProc = new AsmResolver.DotNet.MethodDefinition(
+                "WndProc",
+                MethodAttributes.Family |
+                MethodAttributes.Virtual |
+                MethodAttributes.HideBySig,
+                methodSig);
+
+            var body = new CilMethodBody(wndProc) { ComputeMaxStackOnBuild = true };
+            var callBaseLabel = new CilInstruction(CilOpCodes.Ldarg_0);
+
+            var il = body.Instructions;
+            // if (m.Msg == WM_CLOSE) { Application.Exit(); return; }
+            il.Add(new CilInstruction(CilOpCodes.Ldarg_1));
+            il.Add(new CilInstruction(CilOpCodes.Call, refs.MessageGetMsg));
+            il.Add(new CilInstruction(CilOpCodes.Ldc_I4, 0x0010)); // WM_CLOSE
+            il.Add(new CilInstruction(CilOpCodes.Bne_Un, new CilInstructionLabel(callBaseLabel)));
+            il.Add(new CilInstruction(CilOpCodes.Call, refs.ApplicationExit));
+            il.Add(new CilInstruction(CilOpCodes.Ret));
+            // base.WndProc(ref m)
+            il.Add(callBaseLabel);
+            il.Add(new CilInstruction(CilOpCodes.Ldarg_1));
+            il.Add(new CilInstruction(CilOpCodes.Call, refs.FormWndProc));
+            il.Add(new CilInstruction(CilOpCodes.Ret));
+
+            wndProc.CilMethodBody = body;
+            type.Methods.Add(wndProc);
+        }
+
+        private sealed class WindowsFormsControlReferences
+        {
+            public ITypeDefOrRef ButtonType { get; set; }
+            public IMethodDescriptor FormCtor { get; set; }
+            public IMethodDescriptor TextBoxCtor { get; set; }
+            public IMethodDescriptor ButtonCtor { get; set; }
+            public IMethodDescriptor SizeCtor { get; set; }
+            public IMethodDescriptor SizeFCtor { get; set; }
+            public IMethodDescriptor EventHandlerCtor { get; set; }
+            public IMethodDescriptor ControlSetText { get; set; }
+            public IMethodDescriptor ControlSetName { get; set; }
+            public IMethodDescriptor ControlSetLeft { get; set; }
+            public IMethodDescriptor ControlSetTop { get; set; }
+            public IMethodDescriptor ControlSetWidth { get; set; }
+            public IMethodDescriptor ControlSetHeight { get; set; }
+            public IMethodDescriptor ControlSetTabIndex { get; set; }
+            public IMethodDescriptor ControlSetAnchor { get; set; }
+            public IMethodDescriptor ControlGetControls { get; set; }
+            public IMethodDescriptor ControlAddClick { get; set; }
+            public IMethodDescriptor ControlCollectionAdd { get; set; }
+            public IMethodDescriptor TextBoxSetPasswordChar { get; set; }
+            public IMethodDescriptor ButtonBaseSetUseVisualStyleBackColor { get; set; }
+            public IMethodDescriptor FormSetClientSize { get; set; }
+            public IMethodDescriptor ContainerSetAutoScaleDimensions { get; set; }
+            public IMethodDescriptor ContainerSetAutoScaleMode { get; set; }
+            public IMethodDescriptor FormSetFormBorderStyle { get; set; }
+            public IMethodDescriptor FormSetStartPosition { get; set; }
+            public IMethodDescriptor FormSetMaximizeBox { get; set; }
+            public IMethodDescriptor FormSetMinimizeBox { get; set; }
+            public IMethodDescriptor FormDisposeBool { get; set; }
+            public IMethodDescriptor DisposableDispose { get; set; }
+            // WndProc override support
+            public AsmResolver.DotNet.ModuleDefinition Module { get; set; }
+            public ITypeDefOrRef FormBaseType { get; set; }
+            public IMethodDescriptor ApplicationExit { get; set; }
+            public IMethodDescriptor FormWndProc { get; set; }
+            public IMethodDescriptor MessageGetMsg { get; set; }
+            public TypeSignature MessageByRefType { get; set; }
+        }
+
+        private sealed class WinFormsSnapshot
+        {
+            public string TypeName { get; set; }
+            public string TypeToken { get; set; }
+            public string Text { get; set; }
+            public int? ClientWidth { get; set; }
+            public int? ClientHeight { get; set; }
+            public int? FormBorderStyle { get; set; }
+            public int? StartPosition { get; set; }
+            public bool? MaximizeBox { get; set; }
+            public bool? MinimizeBox { get; set; }
+            public int? AutoScaleMode { get; set; }
+            public float? AutoScaleWidth { get; set; }
+            public float? AutoScaleHeight { get; set; }
+            public List<WinFormsControlSnapshot> Controls { get; } = new List<WinFormsControlSnapshot>();
+        }
+
+        private sealed class WinFormsControlSnapshot
+        {
+            public string TypeName { get; set; }
+            public string FieldName { get; set; }
+            public string FieldToken { get; set; }
+            public string Name { get; set; }
+            public string Text { get; set; }
+            public int Left { get; set; }
+            public int Top { get; set; }
+            public int Width { get; set; }
+            public int Height { get; set; }
+            public int TabIndex { get; set; }
+            public int Anchor { get; set; }
+            public int PasswordChar { get; set; }
+            public bool? UseVisualStyleBackColor { get; set; }
+            public List<WinFormsControlSnapshot> Controls { get; } = new List<WinFormsControlSnapshot>();
+        }
+
+        private sealed class ControlSlot
+        {
+            public AsmResolver.DotNet.FieldDefinition Field { get; set; }
+            public CilLocalVariable Local { get; set; }
+            public ITypeDefOrRef Type { get; set; }
+        }
+
+        private sealed class PayloadBuffer
+        {
+            public string Name { get; set; }
+            public byte[] Data { get; set; }
+        }
+
+        private sealed class HiddenCallEntry
+        {
+            public string DeclaringType { get; set; }
+            public string MethodName { get; set; }
+            public string MemberSig { get; set; }
+        }
+
+        private sealed class RawIlInstruction
+        {
+            public int Offset { get; set; }
+            public int Op { get; set; }
+            public uint Token { get; set; }
+            public int? Int32 { get; set; }
+            public float? Single { get; set; }
+        }
+
+        private int RepairStaticDataInitializers(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            var repaired = 0;
+            foreach (var type in module.GetAllTypes())
+            {
+                var cctor = type.Methods.FirstOrDefault(m =>
+                    m.IsStatic &&
+                    string.Equals(m.Name, ".cctor", StringComparison.Ordinal) &&
+                    m.CilMethodBody != null);
+                if (cctor?.CilMethodBody == null)
+                    continue;
+
+                if (TryRepairStaticDataInitializer(module, cctor))
+                    repaired++;
+            }
+
+            return repaired;
+        }
+
+        private bool TryRepairStaticDataInitializer(
+            AsmResolver.DotNet.ModuleDefinition module,
+            AsmResolver.DotNet.MethodDefinition cctor)
+        {
+            var body = cctor.CilMethodBody;
+            var instructions = body.Instructions;
+            if (instructions.Count < 12)
+                return false;
+
+            IMethodDescriptor initArray = null;
+            IFieldDescriptor initWrapperField = null;
+            IFieldDescriptor tokenField = null;
+            AsmResolver.DotNet.FieldDefinition targetField = null;
+            var arrayLength = -1;
+
+            for (var i = 0; i < instructions.Count; i++)
+            {
+                var instruction = instructions[i];
+                if ((instruction.OpCode.Code != CilCode.Call && instruction.OpCode.Code != CilCode.Callvirt) ||
+                    !(instruction.Operand is IMethodDescriptor method))
+                {
+                    continue;
+                }
+
+                if (!IsInitializeArrayCall(method) && !IsInitializeArrayWrapper(method))
+                    continue;
+
+                initArray = method;
+                for (var j = i - 1; j >= 0; j--)
+                {
+                    var previous = instructions[j];
+                    if (tokenField == null &&
+                        previous.OpCode.Code == CilCode.Ldtoken &&
+                        previous.Operand is IFieldDescriptor fieldDescriptor)
+                    {
+                        tokenField = fieldDescriptor;
+                    }
+
+                    if (initWrapperField == null &&
+                        previous.OpCode.Code == CilCode.Ldsfld &&
+                        previous.Operand is IFieldDescriptor wrapperField)
+                    {
+                        initWrapperField = wrapperField;
+                    }
+
+                    if (arrayLength < 0 && TryGetLdcI4Value(previous, out var length))
+                        arrayLength = length;
+
+                    if (tokenField != null && arrayLength >= 0)
+                        break;
+                }
+
+                for (var j = i + 1; j < instructions.Count; j++)
+                {
+                    var next = instructions[j];
+                    if (next.OpCode.Code == CilCode.Stsfld && next.Operand is AsmResolver.DotNet.FieldDefinition field)
+                    {
+                        targetField = field;
+                        break;
+                    }
+                }
+
+                break;
+            }
+
+            if (arrayLength < 0 && tokenField != null)
+                arrayLength = TryGetArrayLengthFromFieldToken(tokenField);
+
+            if (initArray == null ||
+                tokenField == null ||
+                targetField == null ||
+                arrayLength <= 0 ||
+                !IsByteArrayField(targetField))
+            {
+                return false;
+            }
+
+            var replacementInitArray = IsInitializeArrayCall(initArray)
+                ? initArray
+                : FindRuntimeHelpersInitializeArrayReference(module);
+            if (replacementInitArray == null)
+                return false;
+
+            var corlib = module.CorLibTypeFactory;
+            var arrayType = new SzArrayTypeSignature(corlib.Byte);
+            var replacement = new CilMethodBody(cctor)
+            {
+                InitializeLocals = true,
+                ComputeMaxStackOnBuild = true
+            };
+            var local = new CilLocalVariable(arrayType);
+            replacement.LocalVariables.Add(local);
+
+            replacement.Instructions.Add(new CilInstruction(CilOpCodes.Ldc_I4, arrayLength));
+            replacement.Instructions.Add(new CilInstruction(CilOpCodes.Newarr, corlib.Byte.Type));
+            replacement.Instructions.Add(new CilInstruction(CilOpCodes.Stloc, local));
+            replacement.Instructions.Add(new CilInstruction(CilOpCodes.Ldloc, local));
+            replacement.Instructions.Add(new CilInstruction(CilOpCodes.Ldtoken, tokenField));
+            replacement.Instructions.Add(new CilInstruction(CilOpCodes.Call, replacementInitArray));
+            replacement.Instructions.Add(new CilInstruction(CilOpCodes.Ldloc, local));
+            replacement.Instructions.Add(new CilInstruction(CilOpCodes.Stsfld, targetField));
+            replacement.Instructions.Add(new CilInstruction(CilOpCodes.Ret));
+
+            cctor.CilMethodBody = replacement;
+            return true;
+        }
+
+        private bool IsInitializeArrayCall(IMethodDescriptor method)
+        {
+            if (method == null)
+                return false;
+
+            AsmResolver.DotNet.MethodDefinition resolved = null;
+            try
+            {
+                resolved = method.Resolve();
+            }
+            catch
+            {
+                // Protected metadata may be partially malformed; keep signature/name fallback.
+            }
+
+            var name = method.Name ?? resolved?.Name;
+            var declaringTypeFullName = method.DeclaringType?.FullName ?? resolved?.DeclaringType?.FullName;
+            return string.Equals(name, "InitializeArray", StringComparison.Ordinal) &&
+                   string.Equals(
+                       declaringTypeFullName,
+                       "System.Runtime.CompilerServices.RuntimeHelpers",
+                       StringComparison.Ordinal);
+        }
+
+        private IMethodDescriptor FindRuntimeHelpersInitializeArrayReference(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            if (module == null)
+                return null;
+
+            foreach (var type in module.GetAllTypes())
+            {
+                foreach (var method in type.Methods)
+                {
+                    var body = method.CilMethodBody;
+                    if (body == null)
+                        continue;
+
+                    foreach (var instruction in body.Instructions)
+                    {
+                        if (instruction.OpCode.Code != CilCode.Call &&
+                            instruction.OpCode.Code != CilCode.Callvirt)
+                        {
+                            continue;
+                        }
+
+                        var descriptor = instruction.Operand as IMethodDescriptor;
+                        if (descriptor != null && IsInitializeArrayCall(descriptor))
+                            return descriptor;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        private bool IsInitializeArrayWrapper(IMethodDescriptor method)
+        {
+            if (method?.Signature == null || method.Signature.ParameterTypes.Count < 2)
+                return false;
+
+            return string.Equals(
+                method.Signature.ParameterTypes[1]?.FullName,
+                "System.RuntimeFieldHandle",
+                StringComparison.Ordinal);
+        }
+
+        private bool RequiresInitializeArrayWrapperField(
+            IMethodDescriptor method,
+            IFieldDescriptor wrapperField)
+        {
+            if (method?.Signature == null)
+                return false;
+
+            return method.Signature.ParameterTypes.Count >= 3 && wrapperField != null;
+        }
+
+        private bool IsByteArrayField(AsmResolver.DotNet.FieldDefinition field)
+        {
+            var fieldTypeName = field?.Signature?.FieldType?.FullName;
+            return string.Equals(fieldTypeName, "System.Byte[]", StringComparison.Ordinal) ||
+                   string.Equals(fieldTypeName, "System.Byte[*]", StringComparison.Ordinal);
+        }
+
+        private int TryGetArrayLengthFromFieldToken(IFieldDescriptor tokenField)
+        {
+            try
+            {
+                var declaringType = tokenField?.DeclaringType?.Resolve();
+                if (declaringType?.ClassLayout?.ClassSize > 0)
+                    return (int) declaringType.ClassLayout.ClassSize;
+            }
+            catch
+            {
+                // Best effort only.
+            }
+
+            return -1;
+        }
+
+        private int RepairAesTransformFinalBlockLengthPatterns(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            var repaired = 0;
+            foreach (var type in module.GetAllTypes())
+            {
+                foreach (var method in type.Methods)
+                {
+                    var body = method.CilMethodBody;
+                    if (body == null)
+                        continue;
+
+                    var instructions = body.Instructions;
+                    for (var i = 7; i < instructions.Count; i++)
+                    {
+                        var call = instructions[i];
+                        if ((call.OpCode.Code != CilCode.Callvirt && call.OpCode.Code != CilCode.Call) ||
+                            !(call.Operand is IMethodDescriptor descriptor) ||
+                            !IsCryptoTransformFinalBlock(descriptor))
+                        {
+                            continue;
+                        }
+
+                        var firstBufferLoad = instructions[i - 7];
+                        var offset = instructions[i - 6];
+                        var secondBufferLoad = instructions[i - 5];
+                        var ldlen = instructions[i - 4];
+                        var conv = instructions[i - 3];
+                        var lengthAdjustment = instructions[i - 2];
+                        var arithmetic = instructions[i - 1];
+
+                        if (!AreSameStackValueLoad(firstBufferLoad, secondBufferLoad))
+                            continue;
+                        if (!TryGetLdcI4Value(offset, out var offsetValue) || offsetValue != 16)
+                            continue;
+                        if (ldlen.OpCode.Code != CilCode.Ldlen)
+                            continue;
+                        if (conv.OpCode.Code != CilCode.Conv_I4)
+                            continue;
+                        if (!TryGetLdcI4Value(lengthAdjustment, out var lengthAdjustmentValue) ||
+                            lengthAdjustmentValue != 16)
+                        {
+                            continue;
+                        }
+
+                        if (arithmetic.OpCode.Code != CilCode.Add)
+                            continue;
+
+                        arithmetic.OpCode = CilOpCodes.Sub;
+                        arithmetic.Operand = null;
+                        repaired++;
+                    }
+                }
+            }
+
+            return repaired;
+        }
+
+        private bool IsCryptoTransformFinalBlock(IMethodDescriptor descriptor)
+        {
+            if (descriptor == null)
+                return false;
+
+            AsmResolver.DotNet.MethodDefinition resolved = null;
+            try
+            {
+                resolved = descriptor.Resolve();
+            }
+            catch
+            {
+                // Metadata in protected assemblies is often partially malformed; signature fallback below is enough.
+            }
+
+            if (!string.Equals(descriptor.Name ?? resolved?.Name, "TransformFinalBlock", StringComparison.Ordinal))
+                return false;
+
+            var declaringTypeFullName = descriptor.DeclaringType?.FullName ?? resolved?.DeclaringType?.FullName;
+            if (!string.Equals(
+                    declaringTypeFullName,
+                    "System.Security.Cryptography.ICryptoTransform",
+                    StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            var signature = descriptor.Signature ?? resolved?.Signature;
+            if (signature == null || signature.ParameterTypes.Count != 3)
+                return false;
+
+            return string.Equals(signature.ReturnType?.FullName, "System.Byte[]", StringComparison.Ordinal) &&
+                   string.Equals(signature.ParameterTypes[0].FullName, "System.Byte[]", StringComparison.Ordinal) &&
+                   string.Equals(signature.ParameterTypes[1].FullName, "System.Int32", StringComparison.Ordinal) &&
+                   string.Equals(signature.ParameterTypes[2].FullName, "System.Int32", StringComparison.Ordinal);
+        }
+
+        private bool AreSameStackValueLoad(CilInstruction first, CilInstruction second)
+        {
+            if (!TryGetStackValueLoadIdentity(first, out var firstKind, out var firstValue))
+                return false;
+            if (!TryGetStackValueLoadIdentity(second, out var secondKind, out var secondValue))
+                return false;
+            if (!string.Equals(firstKind, secondKind, StringComparison.Ordinal))
+                return false;
+
+            return ReferenceEquals(firstValue, secondValue) || Equals(firstValue, secondValue);
+        }
+
+        private bool TryGetStackValueLoadIdentity(CilInstruction instruction, out string kind, out object value)
+        {
+            kind = null;
+            value = null;
+            if (instruction == null)
+                return false;
+
+            switch (instruction.OpCode.Code)
+            {
+                case CilCode.Ldarg_0:
+                    kind = "arg";
+                    value = 0;
+                    return true;
+                case CilCode.Ldarg_1:
+                    kind = "arg";
+                    value = 1;
+                    return true;
+                case CilCode.Ldarg_2:
+                    kind = "arg";
+                    value = 2;
+                    return true;
+                case CilCode.Ldarg_3:
+                    kind = "arg";
+                    value = 3;
+                    return true;
+                case CilCode.Ldarg:
+                case CilCode.Ldarg_S:
+                    if (instruction.Operand == null)
+                        return false;
+                    kind = "arg";
+                    value = instruction.Operand;
+                    return true;
+                case CilCode.Ldloc_0:
+                    kind = "loc";
+                    value = 0;
+                    return true;
+                case CilCode.Ldloc_1:
+                    kind = "loc";
+                    value = 1;
+                    return true;
+                case CilCode.Ldloc_2:
+                    kind = "loc";
+                    value = 2;
+                    return true;
+                case CilCode.Ldloc_3:
+                    kind = "loc";
+                    value = 3;
+                    return true;
+                case CilCode.Ldloc:
+                case CilCode.Ldloc_S:
+                    if (instruction.Operand == null)
+                        return false;
+                    kind = "loc";
+                    value = instruction.Operand;
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
         private bool IsLdcI4Zero(CilInstruction instruction)
         {
             switch (instruction.OpCode.Code)
@@ -2810,26 +6014,42 @@ namespace Krypton.Pipeline
         private bool LooksLikeBootstrapTypeInitializer(AsmResolver.DotNet.MethodDefinition cctor)
         {
             var instructions = cctor.CilMethodBody.Instructions;
-            if (instructions.Count < 1 || instructions.Count > 3)
+            if (instructions.Count < 1 || instructions.Count > 64)
                 return false;
 
-            var first = instructions[0];
-            if (first.OpCode.Code != CilCode.Call && first.OpCode.Code != CilCode.Callvirt)
-                return false;
+            foreach (var instruction in instructions)
+            {
+                if (instruction.OpCode.Code != CilCode.Call && instruction.OpCode.Code != CilCode.Callvirt)
+                    continue;
 
-            if (!(first.Operand is IMethodDescriptor callee))
-                return false;
+                if (!(instruction.Operand is IMethodDescriptor callee))
+                    continue;
 
-            var calleeDef = callee.Resolve();
-            var calleeBody = calleeDef?.CilMethodBody;
-            if (calleeBody == null)
-                return false;
+                AsmResolver.DotNet.MethodDefinition calleeDef;
+                try
+                {
+                    calleeDef = callee.Resolve();
+                }
+                catch
+                {
+                    continue;
+                }
 
-            // Generic heuristic for protector bootstrap stubs:
-            // tiny .cctor -> one call -> huge obfuscated bootstrap method.
-            return calleeBody.Instructions.Count >= 500 ||
-                   calleeBody.LocalVariables.Count >= 64 ||
-                   calleeBody.ExceptionHandlers.Count >= 8;
+                var calleeBody = calleeDef?.CilMethodBody;
+                if (calleeBody == null)
+                    continue;
+
+                // Generic heuristic for protector bootstrap stubs:
+                // a bounded .cctor dispatches into a huge obfuscated runtime worker.
+                if (calleeBody.Instructions.Count >= 500 ||
+                    calleeBody.LocalVariables.Count >= 64 ||
+                    calleeBody.ExceptionHandlers.Count >= 8)
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private int StripMalformedCustomAttributes(AsmResolver.DotNet.ModuleDefinition module)
@@ -2990,6 +6210,526 @@ namespace Krypton.Pipeline
             {
                 if (namedArg == null || namedArg.ArgumentType == null || namedArg.Argument == null ||
                     namedArg.Argument.ArgumentType == null)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private sealed class ReactorRuntimeCleanupResult
+        {
+            public int RuntimeTypes { get; set; }
+            public int ReachableMethods { get; set; }
+            public int StubbedMethods { get; set; }
+            public int DisabledPInvokes { get; set; }
+            public int TotalChanges => StubbedMethods + DisabledPInvokes;
+        }
+
+        private ReactorRuntimeCleanupResult CleanUnusedReactorRuntime(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            var result = new ReactorRuntimeCleanupResult();
+            if (module == null)
+                return result;
+
+            var allTypes = module.GetAllTypes().ToList();
+            var allMethods = allTypes
+                .SelectMany(t => t.Methods)
+                .Where(m => m != null)
+                .ToHashSet();
+
+            var runtimeTypes = IdentifyReactorRuntimeTypes(allTypes);
+            result.RuntimeTypes = runtimeTypes.Count;
+            if (runtimeTypes.Count == 0)
+                return result;
+
+            var reachable = BuildReachableMethodSet(module, allTypes, allMethods, runtimeTypes);
+            result.ReachableMethods = reachable.Count;
+
+            foreach (var type in runtimeTypes.OrderBy(t => t.MetadataToken.ToUInt32()))
+            {
+                foreach (var method in type.Methods.OrderBy(m => m.MetadataToken.ToUInt32()).ToList())
+                {
+                    if (method == null)
+                        continue;
+                    if (reachable.Contains(method))
+                        continue;
+                    if (method.Signature == null)
+                        continue;
+
+                    if (method.ImplementationMap != null)
+                    {
+                        if (TryDisablePInvokeImport(method))
+                        {
+                            result.DisabledPInvokes++;
+                            result.StubbedMethods++;
+                        }
+                        continue;
+                    }
+
+                    if (method.CilMethodBody == null)
+                        continue;
+
+                    // Keep instance constructors verifier-friendly. Runtime .cctors are safe to neutralize.
+                    if (method.IsConstructor && !method.IsStatic)
+                        continue;
+
+                    if (!TryReplaceWithSafeReturnStub(method))
+                        continue;
+
+                    result.StubbedMethods++;
+                }
+            }
+
+            return result;
+        }
+
+        private HashSet<AsmResolver.DotNet.TypeDefinition> IdentifyReactorRuntimeTypes(
+            IReadOnlyList<AsmResolver.DotNet.TypeDefinition> allTypes)
+        {
+            var runtimeTypes = new HashSet<AsmResolver.DotNet.TypeDefinition>();
+
+            foreach (var type in allTypes)
+            {
+                if (IsReactorRuntimeTypeSeed(type))
+                    runtimeTypes.Add(type);
+            }
+
+            var changed = true;
+            while (changed)
+            {
+                changed = false;
+                foreach (var type in allTypes)
+                {
+                    if (type == null || runtimeTypes.Contains(type))
+                        continue;
+                    if (IsPrivateImplementationDetailsType(type))
+                        continue;
+                    if (!IsLikelyReactorCompanionType(type))
+                        continue;
+                    if (!CallsAnyRuntimeType(type, runtimeTypes))
+                        continue;
+
+                    runtimeTypes.Add(type);
+                    changed = true;
+                }
+            }
+
+            return runtimeTypes;
+        }
+
+        private bool IsReactorRuntimeTypeSeed(AsmResolver.DotNet.TypeDefinition type)
+        {
+            if (type == null)
+                return false;
+            if (IsPrivateImplementationDetailsType(type))
+                return false;
+
+            var fullName = SafeStringify(type.FullName);
+            if (string.IsNullOrWhiteSpace(fullName))
+                return false;
+
+            if (type.IsModuleType)
+                return HasRuntimeLikeStaticConstructor(type) || type.Methods.Count > 0;
+
+            if (fullName.IndexOf("<Module>{", StringComparison.Ordinal) >= 0)
+                return true;
+
+            if (ContainsNonAsciiOrControl(fullName))
+                return true;
+
+            var maxBody = type.Methods
+                .Where(m => m?.CilMethodBody != null)
+                .Select(m => m.CilMethodBody.Instructions.Count)
+                .DefaultIfEmpty(0)
+                .Max();
+
+            return type.Methods.Count >= 40 ||
+                   type.Fields.Count >= 30 ||
+                   maxBody >= 300;
+        }
+
+        private bool IsLikelyReactorCompanionType(AsmResolver.DotNet.TypeDefinition type)
+        {
+            if (type == null)
+                return false;
+            if (IsPrivateImplementationDetailsType(type))
+                return false;
+
+            var name = SafeStringify(type.Name);
+            var ns = SafeStringify(type.Namespace);
+            var fullName = SafeStringify(type.FullName);
+
+            if (ContainsNonAsciiOrControl(fullName))
+                return true;
+            if (fullName.IndexOf("<Module>{", StringComparison.Ordinal) >= 0)
+                return true;
+
+            if (string.IsNullOrEmpty(ns) &&
+                name.StartsWith("Type_", StringComparison.Ordinal) &&
+                type.Methods.Count <= 8)
+            {
+                return true;
+            }
+
+            var baseName = SafeStringify(type.BaseType?.FullName);
+            if (string.Equals(baseName, "System.MulticastDelegate", StringComparison.Ordinal) ||
+                string.Equals(baseName, "System.Delegate", StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            return HasRuntimeLikeStaticConstructor(type);
+        }
+
+        private bool CallsAnyRuntimeType(
+            AsmResolver.DotNet.TypeDefinition type,
+            ISet<AsmResolver.DotNet.TypeDefinition> runtimeTypes)
+        {
+            foreach (var method in type.Methods)
+            {
+                var body = method?.CilMethodBody;
+                if (body == null)
+                    continue;
+
+                foreach (var instruction in body.Instructions)
+                {
+                    if (!IsMethodReferenceInstruction(instruction))
+                        continue;
+                    if (!(instruction.Operand is IMethodDescriptor descriptor))
+                        continue;
+
+                    AsmResolver.DotNet.MethodDefinition resolved;
+                    try
+                    {
+                        resolved = descriptor.Resolve();
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (resolved?.DeclaringType != null && runtimeTypes.Contains(resolved.DeclaringType))
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        private bool HasRuntimeLikeStaticConstructor(AsmResolver.DotNet.TypeDefinition type)
+        {
+            var cctor = type?.Methods?.FirstOrDefault(m =>
+                m != null &&
+                m.IsStatic &&
+                string.Equals(m.Name, ".cctor", StringComparison.Ordinal) &&
+                m.CilMethodBody != null);
+            if (cctor?.CilMethodBody == null)
+                return false;
+
+            foreach (var instruction in cctor.CilMethodBody.Instructions)
+            {
+                if (!IsMethodReferenceInstruction(instruction))
+                    continue;
+
+                var identity = GetMethodIdentity(instruction.Operand as IMethodDescriptor);
+                if (identity.IndexOf("RuntimeHelpers", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    identity.IndexOf("Module::Resolve", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    identity.IndexOf("CreateDelegate", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    identity.IndexOf("DynamicMethod", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    identity.IndexOf("GetManifestResourceStream", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private HashSet<AsmResolver.DotNet.MethodDefinition> BuildReachableMethodSet(
+            AsmResolver.DotNet.ModuleDefinition module,
+            IReadOnlyList<AsmResolver.DotNet.TypeDefinition> allTypes,
+            ISet<AsmResolver.DotNet.MethodDefinition> allMethods,
+            ISet<AsmResolver.DotNet.TypeDefinition> runtimeTypes)
+        {
+            var reachable = new HashSet<AsmResolver.DotNet.MethodDefinition>();
+            var queue = new Queue<AsmResolver.DotNet.MethodDefinition>();
+
+            void AddMethod(AsmResolver.DotNet.MethodDefinition method)
+            {
+                if (method == null || !allMethods.Contains(method))
+                    return;
+                if (!reachable.Add(method))
+                    return;
+
+                queue.Enqueue(method);
+
+                if (method.DeclaringType != null && !runtimeTypes.Contains(method.DeclaringType))
+                {
+                    var cctor = GetStaticConstructor(method.DeclaringType);
+                    if (cctor != null && !ReferenceEquals(cctor, method))
+                        AddMethod(cctor);
+                }
+            }
+
+            AddMethod(module.ManagedEntryPoint as AsmResolver.DotNet.MethodDefinition);
+            AddMethod(module.ManagedEntryPointMethod);
+
+            foreach (var vmMethod in Ctx.VirtualizedMethods ?? Array.Empty<Core.Architecture.VMMethod>())
+            {
+                if (vmMethod?.Parent != null &&
+                    vmMethod.RecompiledBody != null &&
+                    !runtimeTypes.Contains(vmMethod.Parent.DeclaringType))
+                {
+                    AddMethod(vmMethod.Parent);
+                }
+            }
+
+            var rootAllApplicationTypes = GetFeatureToggle(
+                "KRYPTON_REACTOR_CLEAN_ROOT_ALL_APP_TYPES",
+                defaultEnabled: false,
+                disableVariableName: "KRYPTON_DISABLE_REACTOR_CLEAN_ROOT_ALL_APP_TYPES");
+            if (rootAllApplicationTypes)
+            {
+                foreach (var type in allTypes)
+                {
+                    if (!IsApplicationPreservationRootType(type, runtimeTypes))
+                        continue;
+
+                    foreach (var method in type.Methods)
+                        AddMethod(method);
+                }
+            }
+
+            while (queue.Count > 0)
+            {
+                var method = queue.Dequeue();
+                var body = method.CilMethodBody;
+                if (body == null)
+                    continue;
+
+                foreach (var instruction in body.Instructions)
+                {
+                    if (IsMethodReferenceInstruction(instruction) &&
+                        instruction.Operand is IMethodDescriptor descriptor &&
+                        TryResolveModuleMethod(descriptor, allMethods, out var callee))
+                    {
+                        AddMethod(callee);
+                    }
+
+                    if (IsStaticFieldReferenceInstruction(instruction) &&
+                        TryResolveModuleField(instruction.Operand, out var field))
+                    {
+                        AddMethod(GetStaticConstructor(field.DeclaringType));
+                    }
+                }
+            }
+
+            return reachable;
+        }
+
+        private bool IsApplicationPreservationRootType(
+            AsmResolver.DotNet.TypeDefinition type,
+            ISet<AsmResolver.DotNet.TypeDefinition> runtimeTypes)
+        {
+            if (type == null)
+                return false;
+            if (runtimeTypes.Contains(type))
+                return false;
+            if (type.IsModuleType)
+                return false;
+            if (IsPrivateImplementationDetailsType(type))
+                return false;
+
+            return true;
+        }
+
+        private AsmResolver.DotNet.MethodDefinition GetStaticConstructor(
+            AsmResolver.DotNet.TypeDefinition type)
+        {
+            return type?.Methods?.FirstOrDefault(m =>
+                m != null &&
+                m.IsStatic &&
+                string.Equals(m.Name, ".cctor", StringComparison.Ordinal));
+        }
+
+        private bool TryResolveModuleMethod(
+            IMethodDescriptor descriptor,
+            ISet<AsmResolver.DotNet.MethodDefinition> allMethods,
+            out AsmResolver.DotNet.MethodDefinition method)
+        {
+            method = null;
+            if (descriptor == null)
+                return false;
+
+            if (descriptor is AsmResolver.DotNet.MethodDefinition direct && allMethods.Contains(direct))
+            {
+                method = direct;
+                return true;
+            }
+
+            try
+            {
+                var resolved = descriptor.Resolve();
+                if (resolved != null && allMethods.Contains(resolved))
+                {
+                    method = resolved;
+                    return true;
+                }
+            }
+            catch
+            {
+                // Best effort for malformed protector metadata.
+            }
+
+            return false;
+        }
+
+        private bool TryResolveModuleField(object operand, out AsmResolver.DotNet.FieldDefinition field)
+        {
+            field = null;
+
+            if (operand is AsmResolver.DotNet.FieldDefinition direct)
+            {
+                field = direct;
+                return true;
+            }
+
+            if (!(operand is IFieldDescriptor descriptor))
+                return false;
+
+            try
+            {
+                field = descriptor.Resolve();
+                return field != null;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool IsMethodReferenceInstruction(CilInstruction instruction)
+        {
+            if (instruction == null)
+                return false;
+
+            return instruction.OpCode.Code == CilCode.Call ||
+                   instruction.OpCode.Code == CilCode.Callvirt ||
+                   instruction.OpCode.Code == CilCode.Newobj ||
+                   instruction.OpCode.Code == CilCode.Ldftn ||
+                   instruction.OpCode.Code == CilCode.Ldvirtftn;
+        }
+
+        private bool IsStaticFieldReferenceInstruction(CilInstruction instruction)
+        {
+            if (instruction == null)
+                return false;
+
+            return instruction.OpCode.Code == CilCode.Ldsfld ||
+                   instruction.OpCode.Code == CilCode.Ldsflda ||
+                   instruction.OpCode.Code == CilCode.Stsfld;
+        }
+
+        private bool TryDisablePInvokeImport(AsmResolver.DotNet.MethodDefinition method)
+        {
+            if (method?.ImplementationMap == null)
+                return false;
+
+            try
+            {
+                method.ImplementationMap = null;
+                method.Attributes &= ~MethodAttributes.PInvokeImpl;
+            }
+            catch
+            {
+                return false;
+            }
+
+            return TryReplaceWithSafeReturnStub(method);
+        }
+
+        private int StripAntiIldasmAttributes(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            if (module == null)
+                return 0;
+
+            var removed = 0;
+            removed += RemoveAntiIldasmAttributes(module);
+
+            if (module.Assembly != null)
+                removed += RemoveAntiIldasmAttributes(module.Assembly);
+
+            foreach (var type in module.GetAllTypes())
+            {
+                removed += RemoveAntiIldasmAttributes(type);
+
+                foreach (var genericParameter in type.GenericParameters)
+                    removed += RemoveAntiIldasmAttributes(genericParameter);
+
+                foreach (var field in type.Fields)
+                    removed += RemoveAntiIldasmAttributes(field);
+
+                foreach (var method in type.Methods)
+                {
+                    removed += RemoveAntiIldasmAttributes(method);
+
+                    foreach (var parameter in method.ParameterDefinitions)
+                        removed += RemoveAntiIldasmAttributes(parameter);
+
+                    foreach (var genericParameter in method.GenericParameters)
+                        removed += RemoveAntiIldasmAttributes(genericParameter);
+                }
+
+                foreach (var property in type.Properties)
+                    removed += RemoveAntiIldasmAttributes(property);
+
+                foreach (var evt in type.Events)
+                    removed += RemoveAntiIldasmAttributes(evt);
+            }
+
+            return removed;
+        }
+
+        private int RemoveAntiIldasmAttributes(AsmResolver.DotNet.IHasCustomAttribute provider)
+        {
+            if (provider?.CustomAttributes == null || provider.CustomAttributes.Count == 0)
+                return 0;
+
+            var removed = 0;
+            for (var i = provider.CustomAttributes.Count - 1; i >= 0; i--)
+            {
+                var attribute = provider.CustomAttributes[i];
+                var identity = SafeStringify(attribute?.Constructor);
+                if (attribute?.Constructor is IMethodDescriptor ctor)
+                {
+                    identity += " " + SafeStringify(ctor.FullName);
+                    identity += " " + SafeStringify(ctor.DeclaringType?.FullName);
+                }
+
+                if (identity.IndexOf("SuppressIldasm", StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+
+                provider.CustomAttributes.RemoveAt(i);
+                removed++;
+            }
+
+            return removed;
+        }
+
+        private bool IsPrivateImplementationDetailsType(AsmResolver.DotNet.TypeDefinition type)
+        {
+            var fullName = SafeStringify(type?.FullName);
+            return fullName.StartsWith("<PrivateImplementationDetails>", StringComparison.Ordinal);
+        }
+
+        private bool ContainsNonAsciiOrControl(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+                return false;
+
+            foreach (var ch in value)
+            {
+                if (ch < 0x20 || ch > 0x7E)
                     return true;
             }
 

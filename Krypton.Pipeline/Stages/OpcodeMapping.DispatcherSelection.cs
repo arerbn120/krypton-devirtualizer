@@ -462,6 +462,7 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.Pop:
                 case VMOpCode.Dup:
                 case VMOpCode.Ret:
+                case VMOpCode.EndFinally:
                 case VMOpCode.Conv_I4:
                 case VMOpCode.Conv_I8:
                 case VMOpCode.Conv_U1:
@@ -499,6 +500,7 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.Ldelema:
                 case VMOpCode.Ldobj:
                 case VMOpCode.Stobj:
+                case VMOpCode.Ldtoken:
                     return operandType == 1;
 
                 case VMOpCode.Switch:

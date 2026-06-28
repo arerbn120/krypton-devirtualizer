@@ -17,7 +17,13 @@ var allMethods = module.GetAllTypes()
     .ToList();
 
 var methods = new System.Collections.Generic.List<MethodDefinition>();
-if (query.StartsWith("call:", StringComparison.OrdinalIgnoreCase))
+if (string.Equals(query, "entry", StringComparison.OrdinalIgnoreCase) &&
+    module.ManagedEntryPointMethod is MethodDefinition entryPoint &&
+    entryPoint.CilMethodBody != null)
+{
+    methods.Add(entryPoint);
+}
+else if (query.StartsWith("call:", StringComparison.OrdinalIgnoreCase))
 {
     var calleeQuery = query.Substring("call:".Length).Trim();
     methods.AddRange(allMethods.Where(m => ContainsCallee(m, calleeQuery)));

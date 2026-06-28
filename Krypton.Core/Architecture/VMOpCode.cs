@@ -35,6 +35,7 @@ namespace Krypton.Core.Architecture
         Shr,
         Neg,
         Ldnull,
+        Ldtoken,
         Switch,
 
         Ldarg,
