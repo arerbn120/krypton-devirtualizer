@@ -1,0 +1,12 @@
+C:\RE\tools\krypton-devirtualizer\Krypton.Core\bin\Debug\net8.0\Krypton.Core.deps.json
+C:\RE\tools\krypton-devirtualizer\Krypton.Core\bin\Debug\net8.0\Krypton.Core.dll
+C:\RE\tools\krypton-devirtualizer\Krypton.Core\bin\Debug\net8.0\Krypton.Core.pdb
+C:\RE\tools\krypton-devirtualizer\Krypton.Core\obj\Debug\net8.0\Krypton.Core.csproj.AssemblyReference.cache
+C:\RE\tools\krypton-devirtualizer\Krypton.Core\obj\Debug\net8.0\Krypton.Core.GeneratedMSBuildEditorConfig.editorconfig
+C:\RE\tools\krypton-devirtualizer\Krypton.Core\obj\Debug\net8.0\Krypton.Core.AssemblyInfoInputs.cache
+C:\RE\tools\krypton-devirtualizer\Krypton.Core\obj\Debug\net8.0\Krypton.Core.AssemblyInfo.cs
+C:\RE\tools\krypton-devirtualizer\Krypton.Core\obj\Debug\net8.0\Krypton.Core.csproj.CoreCompileInputs.cache
+C:\RE\tools\krypton-devirtualizer\Krypton.Core\obj\Debug\net8.0\Krypton.Core.dll
+C:\RE\tools\krypton-devirtualizer\Krypton.Core\obj\Debug\net8.0\refint\Krypton.Core.dll
+C:\RE\tools\krypton-devirtualizer\Krypton.Core\obj\Debug\net8.0\Krypton.Core.pdb
+C:\RE\tools\krypton-devirtualizer\Krypton.Core\obj\Debug\net8.0\ref\Krypton.Core.dll
