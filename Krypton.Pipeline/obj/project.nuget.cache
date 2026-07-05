@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "dgSpecHash": "1WIv5bk7v6c=",
+  "success": true,
+  "projectFilePath": "C:\\RE\\tools\\krypton-devirtualizer\\Krypton.Pipeline\\Krypton.Pipeline.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\root\\.nuget\\packages\\asmresolver\\5.5.1\\asmresolver.5.5.1.nupkg.sha512",
+    "C:\\Users\\root\\.nuget\\packages\\asmresolver.dotnet\\5.5.1\\asmresolver.dotnet.5.5.1.nupkg.sha512",
+    "C:\\Users\\root\\.nuget\\packages\\asmresolver.pe\\5.5.1\\asmresolver.pe.5.5.1.nupkg.sha512",
+    "C:\\Users\\root\\.nuget\\packages\\asmresolver.pe.file\\5.5.1\\asmresolver.pe.file.5.5.1.nupkg.sha512",
+    "C:\\Users\\root\\.nuget\\packages\\system.runtime.compilerservices.unsafe\\6.0.0\\system.runtime.compilerservices.unsafe.6.0.0.nupkg.sha512",
+    "C:\\Users\\root\\.nuget\\packages\\system.text.encodings.web\\6.0.0\\system.text.encodings.web.6.0.0.nupkg.sha512",
+    "C:\\Users\\root\\.nuget\\packages\\system.text.json\\6.0.8\\system.text.json.6.0.8.nupkg.sha512"
+  ],
+  "logs": []
+}

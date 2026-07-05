@@ -1,0 +1,15 @@
+C:\RE\tools\krypton-devirtualizer\Krypton.Pipeline\bin\Release\net8.0\Krypton.Pipeline.deps.json
+C:\RE\tools\krypton-devirtualizer\Krypton.Pipeline\bin\Release\net8.0\Krypton.Pipeline.dll
+C:\RE\tools\krypton-devirtualizer\Krypton.Pipeline\bin\Release\net8.0\Krypton.Pipeline.pdb
+C:\RE\tools\krypton-devirtualizer\Krypton.Pipeline\bin\Release\net8.0\Krypton.Core.dll
+C:\RE\tools\krypton-devirtualizer\Krypton.Pipeline\bin\Release\net8.0\Krypton.Core.pdb
+C:\RE\tools\krypton-devirtualizer\Krypton.Pipeline\obj\Release\net8.0\Krypton.Pipeline.csproj.AssemblyReference.cache
+C:\RE\tools\krypton-devirtualizer\Krypton.Pipeline\obj\Release\net8.0\Krypton.Pipeline.GeneratedMSBuildEditorConfig.editorconfig
+C:\RE\tools\krypton-devirtualizer\Krypton.Pipeline\obj\Release\net8.0\Krypton.Pipeline.AssemblyInfoInputs.cache
+C:\RE\tools\krypton-devirtualizer\Krypton.Pipeline\obj\Release\net8.0\Krypton.Pipeline.AssemblyInfo.cs
+C:\RE\tools\krypton-devirtualizer\Krypton.Pipeline\obj\Release\net8.0\Krypton.Pipeline.csproj.CoreCompileInputs.cache
+C:\RE\tools\krypton-devirtualizer\Krypton.Pipeline\obj\Release\net8.0\Krypton..7D32B836.Up2Date
+C:\RE\tools\krypton-devirtualizer\Krypton.Pipeline\obj\Release\net8.0\Krypton.Pipeline.dll
+C:\RE\tools\krypton-devirtualizer\Krypton.Pipeline\obj\Release\net8.0\refint\Krypton.Pipeline.dll
+C:\RE\tools\krypton-devirtualizer\Krypton.Pipeline\obj\Release\net8.0\Krypton.Pipeline.pdb
+C:\RE\tools\krypton-devirtualizer\Krypton.Pipeline\obj\Release\net8.0\ref\Krypton.Pipeline.dll
