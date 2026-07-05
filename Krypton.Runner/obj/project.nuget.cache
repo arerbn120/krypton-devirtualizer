@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "dgSpecHash": "ZfJZsCSbFwQ=",
+  "success": true,
+  "projectFilePath": "C:\\RE\\tools\\krypton-devirtualizer\\Krypton.Runner\\Krypton.Runner.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\root\\.nuget\\packages\\dnlib\\3.3.4\\dnlib.3.3.4.nupkg.sha512",
+    "C:\\Users\\root\\.nuget\\packages\\lib.harmony\\2.3.3\\lib.harmony.2.3.3.nupkg.sha512",
+    "C:\\Users\\root\\.nuget\\packages\\newtonsoft.json\\13.0.3\\newtonsoft.json.13.0.3.nupkg.sha512"
+  ],
+  "logs": []
+}

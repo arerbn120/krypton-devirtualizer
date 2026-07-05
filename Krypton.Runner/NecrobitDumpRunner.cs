@@ -30,6 +30,25 @@ namespace Krypton.Runner
 
                 var assembly = LoadAndInitialize(targetPath);
                 var hInstance = GetModuleBase(assembly);
+
+                // Static/module constructors alone don't cover instance methods such as
+                // Form..ctor. NecroBit's hook is armed by the protected app's own entry
+                // point (integrity/watchdog setup happens there), so directly
+                // Activator.CreateInstance-ing the form skips that arming step and the
+                // ctor body still runs as its erased stub. Driving the real EntryPoint
+                // (which internally does Application.Run(new Form1())) arms the hook
+                // first and lets the ctor JIT-restore for real before we grab the form
+                // off Application.OpenForms and tear it down.
+                try
+                {
+                    var forms = FormSnapshot.CaptureFromEntryPoint(assembly);
+                    Console.WriteLine("[NecroBit] Ran entry point and captured " + forms.Count + " form(s) to trigger instance-ctor restoration.");
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("[NecroBit] Entry point instantiation pass failed: " + ex.Message);
+                }
+
                 var methodsByRva = BuildMethodsByRva(targetPath);
                 var rows = DumpHashtableBodies(assembly, hInstance, methodsByRva);
 
@@ -158,9 +177,11 @@ namespace Krypton.Runner
                     IDictionary table;
                     try
                     {
-                        if (!typeof(IDictionary).IsAssignableFrom(field.FieldType))
-                            continue;
-
+                        // Check the runtime value, not the declared field type: NecroBit's
+                        // hashtable is frequently stashed behind an `object`-typed static
+                        // field, which the old `IDictionary.IsAssignableFrom(field.FieldType)`
+                        // pre-check silently skipped even when the boxed value was a real
+                        // IDictionary at runtime.
                         table = field.GetValue(null) as IDictionary;
                     }
                     catch

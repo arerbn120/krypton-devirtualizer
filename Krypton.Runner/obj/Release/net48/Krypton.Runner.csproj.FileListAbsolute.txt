@@ -1,0 +1,14 @@
+C:\RE\tools\krypton-devirtualizer\Krypton.Runner\bin\Release\net48\Krypton.Runner.exe.config
+C:\RE\tools\krypton-devirtualizer\Krypton.Runner\bin\Release\net48\Krypton.Runner.exe
+C:\RE\tools\krypton-devirtualizer\Krypton.Runner\bin\Release\net48\Krypton.Runner.pdb
+C:\RE\tools\krypton-devirtualizer\Krypton.Runner\bin\Release\net48\dnlib.dll
+C:\RE\tools\krypton-devirtualizer\Krypton.Runner\bin\Release\net48\0Harmony.dll
+C:\RE\tools\krypton-devirtualizer\Krypton.Runner\bin\Release\net48\Newtonsoft.Json.dll
+C:\RE\tools\krypton-devirtualizer\Krypton.Runner\obj\Release\net48\Krypton.Runner.csproj.AssemblyReference.cache
+C:\RE\tools\krypton-devirtualizer\Krypton.Runner\obj\Release\net48\Krypton.Runner.GeneratedMSBuildEditorConfig.editorconfig
+C:\RE\tools\krypton-devirtualizer\Krypton.Runner\obj\Release\net48\Krypton.Runner.AssemblyInfoInputs.cache
+C:\RE\tools\krypton-devirtualizer\Krypton.Runner\obj\Release\net48\Krypton.Runner.AssemblyInfo.cs
+C:\RE\tools\krypton-devirtualizer\Krypton.Runner\obj\Release\net48\Krypton.Runner.csproj.CoreCompileInputs.cache
+C:\RE\tools\krypton-devirtualizer\Krypton.Runner\obj\Release\net48\Krypton..A6194228.Up2Date
+C:\RE\tools\krypton-devirtualizer\Krypton.Runner\obj\Release\net48\Krypton.Runner.exe
+C:\RE\tools\krypton-devirtualizer\Krypton.Runner\obj\Release\net48\Krypton.Runner.pdb
