@@ -176,5 +176,5 @@ These tools help during opcode mapping extension, payload-body inspection, and p
 3. Add automated multi-sample test matrix (build + devirt + smoke-run).
 4. Add before/after metrics export for objective validation.
 
-## Disclaimer
+## Disclaimers
 This project is intended for research, interoperability, and technical understanding of virtualized/obfuscated code in lawful contexts.
