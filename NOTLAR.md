@@ -1,6 +1,6 @@
 # Krypton Devirtualizer — Notlar
 
-## 2026-07-05 — NecroBit dump hatası bulundu ve düzeltildi
+## 2026-07-06 — NecroBit dump hatası bulundu ve düzeltildi
 
 **Semptom:** `NET Reactor Unpack Me.exe` (`C:\Users\root\Desktop\.NET Reactor v7.5.9.1`)
 üzerinde Krypton çalıştırıldığında üretilen `Devirtualized.exe`, `Form1..ctor()`
